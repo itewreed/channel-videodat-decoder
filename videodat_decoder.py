@@ -15,8 +15,10 @@ die Halbbild-Reihenfolge wird aus der .tbc.json gelesen, falls vorhanden.
 
 Fehlerkorrektur: Pro Bit wird eine Sicherheit (Abstand zur Schwelle)
 gespeichert. Defekte Pakete werden aus der Summe der Sicherheiten aller
-Kopien neu entschieden; danach werden bis zu 3 der 12 unsichersten Bits
-gekippt, wenn genau eine Kombination die Pruefsumme erfuellt.
+Kopien neu entschieden; danach werden Bits gekippt, in denen sich die
+Kopien widersprechen, wenn genau eine Kombination die Pruefsumme erfuellt.
+Einzelne Kopien werden nicht auf Verdacht repariert (die Summen-Pruefsumme
+kann einen Fehler nicht orten).
 
 Bitebene (identisch mit MD-SE.exe, siehe videodat_decode.py):
   NRZ 2 Mbit/s, pro VBI-Zeile 10 Bytes, je Byte Startbit + 8 Datenbits
@@ -48,7 +50,8 @@ Nutzlast, Byte 0 = Typ:
                        [Namenslaenge][Name]
   03  Dateiende/Ankuendigung   [03][Sendezeit 4]
   04  Dateidaten: 2^n - 1 Bytes (meist 255)
-  sonstige (01,05,06,07,0A,81,82): andere Dienste, werden roh abgelegt
+  sonstige: andere Dienste, siehe analyse_dienste() (Uhrzeit, Sendungs-
+  ablauf, Bitlisten, verschluesselte Dienste)
 Jedes Paket wird i.d.R. zweimal gesendet (Gruppen zu 4 Paketen).
 """
 
@@ -65,6 +68,7 @@ import numpy as np
 FS = 35.46895e6
 SPB = FS / 2.0e6
 SYNC = b"\x56\xae"
+MAX_FILE = 64 * 1024 * 1024     # groessere Dateikoepfe gelten als Fehler
 
 
 # ---------------------------------------------------------------------------
@@ -353,34 +357,104 @@ def soft_to_raw(soft):
     return bytes(int(v) ^ 0xFF for v in b @ _BITW)
 
 
-def soft_fix(xs, nflip=12, maxflips=3):
-    """Soft-Decision: Bit-Sicherheiten aller Kopien addieren, danach die
-    unsichersten Bits probeweise kippen. Nur eine eindeutige Loesung wird
-    akzeptiert (die Pruefsumme ist eine reine Summe)."""
+def soft_fix(xs, maxvar=12):
+    """Soft-Decision ueber mehrere Kopien eines Pakets.
+
+    1. Bit-Sicherheiten aller Kopien addieren und neu entscheiden.
+    2. Nur bei mindestens zwei Kopien: Bits, in denen sich die Kopien
+       widersprechen (hoechstens maxvar), probeweise kippen. Akzeptiert
+       wird nur eine eindeutige Loesung.
+    Bei einer einzelnen Kopie werden KEINE Bits auf Verdacht gekippt: Die
+    Pruefsumme ist eine reine Summe und kann den Ort eines Fehlers nicht
+    bestimmen (gleiche Abweichung durch dasselbe Bit in einem anderen Byte);
+    das fuehrte in Simulationen zu ~10 % Fehlreparaturen."""
+    import itertools
     xs = [x for x in xs if x.soft is not None and len(x.soft) == 8 * len(x.raw)]
     if not xs:
         return None
     m = np.sum([x.soft for x in xs], axis=0)
-    # Sync (2 Bytes) ist bekannt
     raw = bytearray(soft_to_raw(m))
     raw[0:9] = xs[0].raw[0:9]       # Sync + Kopf sind allen Kopien gemeinsam
-    if descramble(bytes(raw))[1]:
+    if sum_ok(raw):
         return bytes(raw)
-    cand = np.argsort(np.abs(m[72:]))[:nflip] + 72
-    sols = []
-    import itertools
-    for k in range(1, maxflips + 1):
-        for comb in itertools.combinations(cand, k):
+    if len(xs) < 2:
+        return None
+    hard = np.array([x.soft >= 0 for x in xs])
+    dis = [int(b) for b in np.nonzero(hard.min(0) != hard.max(0))[0] if b >= 72]
+    if not dis or len(dis) > maxvar:
+        return None
+    sol = None
+    for k in range(1, len(dis) + 1):
+        for comb in itertools.combinations(dis, k):
             r = bytearray(raw)
             for bit in comb:
                 r[bit // 8] ^= 1 << (bit % 8)
-            if descramble(bytes(r))[1]:
-                sols.append(bytes(r))
-                if len(sols) > 1:
-                    return None
-        if sols:
-            return sols[0]
-    return None
+            if sum_ok(r):
+                if sol is not None and sol != bytes(r):
+                    return None             # mehrdeutig
+                sol = bytes(r)
+    return sol
+
+
+def sum_ok(raw):
+    """Schnelle Pruefsummenkontrolle ohne Entwuerfeln: Die Permutation
+    aendert die Summe nicht, also reicht die Summe der Rohbytes xor k."""
+    A, B, C = raw[2], raw[3], raw[4]
+    n = 1 << (B & 15)
+    if len(raw) < n + 11:
+        return False
+    k = raw[8] ^ 0x58
+    s = A + B + C + sum(b ^ k for b in raw[9:9 + n])
+    return (s & 0xFFFF) == (raw[9 + n] | raw[10 + n] << 8)
+
+
+def _repair_pair(a, b):
+    """a, b: zwei Kopien gleicher Laenge mit gleichem Kopf.
+    Probiert 'Anfang aus a, Rest aus b' und 'in a fehlt ein Bild (60 Bytes),
+    das aus b eingesetzt wird'. Alles ueber kumulierte Summen."""
+    L = len(a)
+    n = 1 << (a[3] & 15)
+    k = a[8] ^ 0x58
+    base = a[2] + a[3] + a[4]
+    A = np.frombuffer(a, np.uint8).astype(np.int64)
+    Bv = np.frombuffer(b, np.uint8).astype(np.int64)
+    ca = np.concatenate([[0], np.cumsum(A[9:9 + n] ^ k)])
+    cb = np.concatenate([[0], np.cumsum(Bv[9:9 + n] ^ k)])
+    lo, hi = 9 + n, 10 + n
+
+    def ck_of(src_lo, src_hi):
+        return src_lo | src_hi << 8
+
+    sols = set()
+    # 1) a[:s] + b[s:]
+    for s in range(9, L):
+        j = min(max(s - 9, 0), n)
+        tot = base + ca[j] + (cb[n] - cb[j])
+        c = ck_of(a[lo] if lo < s else b[lo], a[hi] if hi < s else b[hi])
+        if (int(tot) & 0xFFFF) == c:
+            r = a[:s] + b[s:]
+            if sum_ok(r):
+                sols.add(r)
+    # 2) a[:s] + b[s:s+60] + a[s:L-60]
+    if L > 70:
+        As = np.concatenate([np.zeros(60, np.int64), A[:-60]])   # As[i]=a[i-60]
+        cas = np.concatenate([[0], np.cumsum(As[9:9 + n] ^ k)])
+        for s in range(9, L - 60):
+            j1 = min(s - 9, n)
+            j2 = min(s + 60 - 9, n)
+            tot = base + ca[j1] + (cb[j2] - cb[j1]) + (cas[n] - cas[j2])
+
+            def pick(p):
+                if p < s:
+                    return a[p]
+                if p < s + 60:
+                    return b[p]
+                return a[p - 60]
+            if (int(tot) & 0xFFFF) == ck_of(pick(lo), pick(hi)):
+                r = a[:s] + b[s:s + 60] + a[s:L - 60]
+                if sum_ok(r):
+                    sols.add(r)
+    return sols.pop() if len(sols) == 1 else None
 
 
 def repair(pk, max_diff=14):
@@ -394,7 +468,6 @@ def repair(pk, max_diff=14):
             continue
         L = max(len(x.raw) for x in xs)
         xs = [x for x in xs if len(x.raw) == L]
-        good = None
         how = "soft"
         # 0) Soft-Decision ueber alle Kopien
         good = soft_fix(xs)
@@ -403,37 +476,46 @@ def repair(pk, max_diff=14):
         if good is None:
             how = "kopien"
         # 1) einzelne Bytefehler: Kombinationen der abweichenden Bytes
-        cols = [sorted(set(x.raw[i] for x in xs)) for i in range(L)]
-        var = [i for i in range(L) if len(cols[i]) > 1]
-        if good is None and 0 < len(var) <= max_diff:
-            base = bytearray(xs[0].raw)
-            for combo in range(1 << len(var)):
+        if good is None:
+            cols = [sorted(set(x.raw[i] for x in xs)) for i in range(L)]
+            var = [i for i in range(L) if len(cols[i]) > 1]
+            if 0 < len(var) <= max_diff and all(len(cols[i]) == 2 for i in var):
+                n = 1 << (xs[0].raw[3] & 15)
+                k = xs[0].raw[8] ^ 0x58
+                base = bytearray(xs[0].raw)
+                for i in var:
+                    base[i] = cols[i][0]
+                combos = np.arange(1 << len(var))[:, None] >> np.arange(len(var)) & 1
+                rawB = np.array([[cols[i][0], cols[i][1]] for i in var])
+                vals = np.where(combos == 1, rawB[:, 1], rawB[:, 0])  # (2^v, v)
+                ref = np.frombuffer(bytes(base), np.uint8).astype(np.int64)
+                tot = np.full(len(combos), base[2] + base[3] + base[4] +
+                              int((ref[9:9 + n] ^ k).sum()))
+                cklo = np.full(len(combos), base[9 + n])
+                ckhi = np.full(len(combos), base[10 + n])
                 for j, i in enumerate(var):
-                    ch = cols[i]
-                    base[i] = ch[(combo >> j) & 1] if len(ch) == 2 else ch[0]
-                if descramble(bytes(base))[1]:
+                    if 9 <= i < 9 + n:
+                        tot += (vals[:, j] ^ k) - (base[i] ^ k)
+                    elif i == 9 + n:
+                        cklo = vals[:, j]
+                    elif i == 10 + n:
+                        ckhi = vals[:, j]
+                hit = np.nonzero((tot & 0xFFFF) == (cklo | ckhi << 8))[0]
+                if len(hit) == 1:          # nur eindeutige Loesungen
+                    for j, i in enumerate(var):
+                        base[i] = int(vals[hit[0], j])
                     good = bytes(base)
-                    break
-        # 2) Anfang aus einer Kopie, Rest aus der anderen; ausgefallenes
-        #    Bild (60 Bytes) in einer Kopie
+        # 2) Anfang/Rest aus verschiedenen Kopien, ausgefallenes Bild
         if good is None:
             for a in xs:
                 for b in xs:
                     if a is b or good:
                         continue
-                    for s in range(9, L):
-                        r = a.raw[:s] + b.raw[s:]
-                        if descramble(r)[1]:
-                            good = r
-                            break
-                    for s in range(9, L - 60):
-                        if good:
-                            break
-                        r = a.raw[:s] + b.raw[s:s + 60] + a.raw[s:L - 60]
-                        if descramble(r)[1]:
-                            good = r
+                    good = _repair_pair(a.raw, b.raw)
         if good:
             pay, ok = descramble(good)
+            if not ok:
+                continue
             for x in xs:
                 x.raw, x.pay, x.ok, x.how = good, pay, True, how
             fixed[how] += 1
@@ -459,89 +541,256 @@ def safe_name(b):
     return n or "unbenannt"
 
 
+NAME_RE = re.compile(rb"[A-Za-z0-9_!$#&@%'(){}~^`\-]{1,8}"
+                     rb"(\.[A-Za-z0-9_!$#&@%'(){}~^`\-]{0,3})?")
+NAME_CH = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+              b"0123456789._$!#&-")
+
+
+def header_fields(p):
+    """Felder eines Dateikopfs (Typ 02/0C) oder None, wenn unplausibel."""
+    if len(p) < 15 or p[0] not in (0x02, 0x0C):
+        return None
+    size = struct.unpack_from("<I", p, 5)[0]
+    nl = p[13]
+    name = p[14:14 + nl]
+    if not (1 <= nl <= 12) or len(name) != nl or size > MAX_FILE:
+        return None
+    return name, size, struct.unpack_from("<I", p, 9)[0]
+
+
+def vote_header(copies):
+    """Bytewise Mehrheitsentscheid ueber defekte Kopien eines Dateikopfs.
+    Bei Gleichstand wird ein fuer Dateinamen typisches Zeichen bevorzugt."""
+    L = min(len(c) for c in copies)
+    out = bytearray(L)
+    for i in range(L):
+        cnt = collections.Counter(c[i] for c in copies)
+        best = max(cnt.values())
+        cands = [v for v, n in cnt.items() if n == best]
+        if len(cands) > 1 and 14 <= i:
+            nice = [v for v in cands if v in NAME_CH]
+            if nice:
+                cands = nice
+        out[i] = cands[0]
+    return bytes(out)
+
+
+def unwrap_counter(xs, back=16, fwd=128):
+    """Paketzaehler C (8 Bit) in Empfangsreihenfolge entfalten.
+
+    Normal sind Vorwaertsspruenge (verlorene Pakete, auch Aufnahmepausen,
+    in denen die Sendung weiterlief) und Ruecksprunge um wenige Pakete
+    (jede Vierergruppe wird zweimal gesendet). Ein groesserer Ruecksprung
+    bedeutet einen Schnitt im Band bzw. einen Neustart der Sendung: Dann
+    beginnt ein neuer Abschnitt, der mit dem vorherigen nicht ueberlappen
+    darf. Einzelne Pakete mit abweichendem
+    Zaehler, auf die keine passenden Pakete folgen, gelten als Ausreisser
+    (u = None)."""
+    def jump(c_from, c_to):
+        d = (c_to - c_from) & 0xFF
+        return d - 256 if d > 128 else d
+
+    res = []
+    last = None            # (C, u)
+    maxu = None
+    for i, x in enumerate(xs):
+        if last is None:
+            u = x.C
+        else:
+            d = jump(last[0], x.C)
+            if -back <= d <= fwd:
+                u = last[1] + d
+            else:
+                # Schnitt oder Ausreisser? Folgende Pakete pruefen
+                follow = [jump(x.C, y.C) for y in xs[i + 1:i + 4]]
+                if follow and sum(-back <= f <= fwd for f in follow) >= \
+                        max(1, len(follow) - 1):
+                    u = maxu + 1024 + (x.C - maxu) % 256   # neuer Abschnitt
+                else:
+                    res.append(None)
+                    continue
+        last = (x.C, u)
+        maxu = u if maxu is None else max(maxu, u)
+        res.append(u)
+    return res
+
+
+def rescue_headers(bad, okx, oku, seq, blksz_hint, log, A):
+    """Defekte Dateikoepfe (Pruefsumme falsch) retten.
+
+    bad: defekte Pakete dieses Stroms mit Kopfstruktur
+    okx/oku: gute Pakete dieses Stroms (Empfangsreihenfolge) + entfaltete
+    Zaehler; seq: u -> Nutzlast der guten Pakete.
+    Ein Kopf wird nur uebernommen, wenn
+      - Name/Groesse plausibel sind,
+      - der Zaehler zum nachfolgenden guten Paket passt (hoechstens 1 Bit
+        Abweichung) und an dieser Stelle noch kein guter Kopf liegt,
+      - die Anzahl Datenbloecke bis zur naechsten Endemarke (Typ 03) zur
+        Dateigroesse passt (falls eine Endemarke empfangen wurde)."""
+    import bisect
+    pos = [x.pos for x in okx]
+    cand = collections.defaultdict(list)
+    for x in bad:
+        if header_fields(x.pay) is None:
+            continue
+        j = bisect.bisect_right(pos, x.pos)
+        if j >= len(okx) or okx[j].pos - x.pos > 4000:
+            continue
+        # Position des Kopfs: zwischen vorherigem und folgendem guten Paket.
+        # Bevorzugt die Stelle, deren Zaehler exakt passt (Folgepakete koennen
+        # fehlen), sonst direkt vor dem Folgepaket bei hoechstens 1 Bitfehler.
+        lo_u = oku[j - 1] + 1 if j > 0 else oku[j] - 8
+        u = None
+        for w in range(oku[j] - 1, max(lo_u, oku[j] - 8) - 1, -1):
+            if (w & 0xFF) == x.C:
+                u = w
+                break
+        if u is None:
+            u = oku[j] - 1
+            if bin((x.C ^ u) & 0xFF).count("1") > 1:
+                continue
+        if seq.get(u, b"\xff")[0] in (0x02, 0x0C):
+            continue                           # guter Kopf vorhanden
+        if any(seq.get(w, b"\x04")[0] != 0x04 for w in range(u + 1, oku[j])):
+            continue
+        cand[u].append(x.pay)
+    rescued = {}
+    for u, copies in cand.items():
+        p = vote_header(copies) if len(copies) > 1 else copies[0]
+        hf = header_fields(p)
+        if hf is None or not NAME_RE.fullmatch(hf[0]):
+            continue
+        name, size, ts = hf
+        if dos_time(ts) is None:
+            continue
+        # Plausibilitaet ueber die Endemarke
+        nblk = -(-size // blksz_hint) if blksz_hint else None
+        end = None
+        for v in range(u + 1, u + 1 + (nblk or 0) + 64):
+            t = seq.get(v)
+            if t is not None and t[0] in (0x02, 0x03, 0x0C):
+                end = v
+                break
+        if end is not None and seq[end][0] == 0x03 and nblk is not None:
+            if end - u - 1 != nblk:
+                continue
+        rescued[u] = p
+        log("  Strom %02X: defekter Dateikopf repariert: %s (%d Bytes, "
+            "%d Kopie%s)" % (A, safe_name(name), size, len(copies),
+                              "n" if len(copies) > 1 else ""))
+    return rescued
+
+
 def assemble(pk, outdir, keep_partial, dump_other, log):
     os.makedirs(outdir, exist_ok=True)
     subs = collections.defaultdict(list)
+    badsubs = collections.defaultdict(list)
     for x in pk:
         if x.ok:
             subs[(x.A, x.B >> 7)].append(x)
+        elif x.pay and x.pay[0] in (0x02, 0x0C):
+            badsubs[(x.A, x.B >> 7)].append(x)
     results = []
+    files = {}
+    n_rescued = 0
     for (A, sub), xs in sorted(subs.items()):
-        # Zaehler C entfalten (Empfangsreihenfolge, Ausreisser ignorieren)
+        us = unwrap_counter(xs)
+        keep = [(x, u) for x, u in zip(xs, us) if u is not None]
+        xs = [x for x, u in keep]
+        us = [u for x, u in keep]
         seq = {}
-        last = None
-        for x in xs:
-            if last is None:
-                u = x.C
-            else:
-                d = (x.C - last[0]) & 0xFF
-                if d > 128:
-                    d -= 256
-                u = last[1] + d
-            if last is None or abs(d) <= 64:
-                last = (x.C, u)
+        votes = collections.defaultdict(collections.Counter)
+        for x, u in keep:
             seq.setdefault(u, x.pay)
+            # unreparierte Pakete zaehlen doppelt
+            votes[u][x.pay] += 2 if getattr(x, "how", "ok") == "ok" else 1
+        bl = collections.Counter(len(p) - 1 for p in seq.values() if p[0] == 4)
+        # Blockgroesse = groesster Datenblock im Strom (normal 255). Der letzte
+        # Block einer Datei wird oft in einem kleineren Paket gesendet und darf
+        # nicht die Blockgroesse bestimmen.
+        blksz_hint = max(bl) if bl else 255
+        resc = rescue_headers(badsubs.get((A, sub), []), xs, us, seq,
+                              blksz_hint, log, A)
+        n_rescued += len(resc)
+        seq.update(resc)
         order = sorted(seq)
         other = collections.Counter()
-        orphan = {}
+        orphan_runs = []          # Daten ohne Dateikopf, in Abschnitten
+        orphan = None
         cur = None
 
         def finish(cur):
+            """Datei-Uebertragung abschliessen und mit frueheren
+            Aussendungen derselben Datei (Name, Groesse, Zeit) vereinen."""
             if cur is None:
                 return
-            data = bytearray()
-            missing = 0
-            for i in range(cur["nblk"]):
-                blk = cur["blocks"].get(i)
-                if blk is None:
-                    missing += 1
-                    blk = bytes(cur["blksz"])
-                data += blk
-            data = data[:cur["size"]]
-            complete = missing == 0 and len(data) == cur["size"]
-            name = cur["name"]
-            if not complete:
-                if not keep_partial:
-                    results.append((A, name, cur["size"], missing,
-                                    cur["nblk"], None))
-                    return
-                name += ".unvollstaendig"
-            sd = os.path.join(outdir, "strom_%02X" % A)
-            os.makedirs(sd, exist_ok=True)
-            path = os.path.join(sd, name)
-            with open(path, "wb") as f:
-                f.write(data)
-            if cur["mtime"]:
-                t = cur["mtime"].timestamp()
-                os.utime(path, (t, t))
-            results.append((A, cur["name"], cur["size"], missing,
-                            cur["nblk"], path))
+            if cur["nblk"] is None:
+                # Dateikopf ohne ein einziges empfangenes Datenpaket
+                cur["blksz"] = blksz_hint
+                cur["nblk"] = -(-cur["size"] // blksz_hint) if blksz_hint else 0
+            key = (cur["name"], cur["size"], cur["mtime"])
+            f = files.get(key)
+            if f is None:
+                f = files[key] = dict(cur, blocks={}, count=0, A=A)
+            if not f["blocks"] and cur["blocks"]:
+                f["blksz"], f["nblk"] = cur["blksz"], cur["nblk"]
+            if cur["blocks"] and f["blksz"] != cur["blksz"]:
+                return               # unterschiedliche Blockgroesse: ignorieren
+            f["count"] += 1
+            for i, cnt in cur["blocks"].items():
+                f["blocks"].setdefault(i, collections.Counter()).update(cnt)
 
         for u in order:
             p = seq[u]
             t = p[0]
             if t in (0x02, 0x0C) and len(p) >= 14:
                 finish(cur)
+                cur = None
+                orphan = None
                 size = struct.unpack_from("<I", p, 5)[0]
                 nl = p[13]
+                if size > MAX_FILE:
+                    log("  Strom %02X: Dateikopf mit unplausibler Groesse "
+                        "%d ignoriert" % (A, size))
+                    continue
                 cur = dict(name=safe_name(p[14:14 + nl]), size=size,
                            mtime=dos_time(struct.unpack_from("<I", p, 9)[0]),
-                           start=u, blocks={}, blksz=None, nblk=None)
-            elif t == 0x04 and cur is None:
-                orphan[u] = p[1:]
-            elif t == 0x04 and cur is not None:
+                           start=u, blocks={}, blksz=blksz_hint,
+                           nblk=-(-size // blksz_hint) if blksz_hint else 0)
+            elif t == 0x04:
                 blk = p[1:]
-                if cur["blksz"] is None:
-                    cur["blksz"] = len(blk)
-                    cur["nblk"] = -(-cur["size"] // len(blk)) if blk else 0
-                i = u - cur["start"] - 1
-                if 0 <= i < cur["nblk"]:
-                    cur["blocks"][i] = blk
-                if i == cur["nblk"] - 1:
-                    finish(cur)
-                    cur = None
+                i = None
+                if cur is not None:
+                    i = u - cur["start"] - 1
+                    if not 0 <= i < cur["nblk"]:
+                        # Daten jenseits des Dateiendes: Kopf der naechsten
+                        # Datei fehlt -> als Daten ohne Dateikopf sammeln
+                        finish(cur)
+                        cur = None
+                        i = None
+                    else:
+                        cur["blocks"][i] = collections.Counter(
+                            {p[1:]: n for p, n in votes[u].items()
+                             if p[0] == 0x04})
+                        if i == cur["nblk"] - 1:
+                            finish(cur)
+                            cur = None
+                if i is None:
+                    if orphan is not None and orphan and \
+                            u - max(k for k in orphan if k != "_ende") > 512:
+                        orphan = None          # Schnitt im Band
+                    if orphan is None:
+                        orphan = {}
+                        orphan_runs.append(orphan)
+                    orphan[u] = blk
             elif t == 0x03:
-                pass
+                # Endemarke / Ankuendigung der naechsten Datei
+                finish(cur)
+                cur = None
+                if orphan is not None:
+                    orphan["_ende"] = u
+                orphan = None
             else:
                 other[t] += 1
                 if dump_other:
@@ -550,31 +799,334 @@ def assemble(pk, outdir, keep_partial, dump_other, log):
                     with open(os.path.join(sd, "strom_%02X_typ_%02X.bin" %
                                            (A, t)), "ab") as f:
                         f.write(p)
-            if t == 0x00 and len(p) > 8 and 0 < p[7] < 40 and \
-                    all(32 < c < 127 for c in p[8:8 + p[7]]):
+            if t == 0x00 and len(p) > 9 and 2 < p[7] < 40 and \
+                    all(32 <= c < 127 for c in p[8:8 + p[7]]):
                 info = p[8:8 + p[7]].decode("ascii")
                 log("  Strom %02X: Infoblock '%s'" % (A, info))
-        if cur is not None:
-            if cur["nblk"] is None:
-                cur["nblk"] = -(-cur["size"] // 255)
-                cur["blksz"] = 255
-            finish(cur)
-        if orphan and keep_partial:
-            # Daten ohne Dateikopf (Uebertragung lief schon vor Aufnahmebeginn)
-            sd = os.path.join(outdir, "strom_%02X" % A)
-            os.makedirs(sd, exist_ok=True)
-            u0, u1 = min(orphan), max(orphan)
-            bs = max(len(b) for b in orphan.values())
-            path = os.path.join(sd, "ohne_dateikopf_%d.bin.unvollstaendig" % u0)
-            with open(path, "wb") as f:
-                for u in range(u0, u1 + 1):
-                    f.write(orphan.get(u, bytes(bs)))
-            log("  Strom %02X/%d: %d Datenbloecke ohne Dateikopf -> %s" %
-                (A, sub, len(orphan), os.path.basename(path)))
+        finish(cur)
+        if keep_partial:
+            for run in orphan_runs:
+                end = run.pop("_ende", None)
+                if not run:
+                    continue
+                # Daten ohne Dateikopf (Kopf vor Aufnahmebeginn gesendet
+                # oder nicht zu retten)
+                sd = os.path.join(outdir, "strom_%02X" % A)
+                os.makedirs(sd, exist_ok=True)
+                u0, u1 = min(run), max(run)
+                bs = max(len(b) for b in run.values())
+                path = os.path.join(sd, "ohne_dateikopf_%d.bin.unvollstaendig"
+                                    % u0)
+                with open(path, "wb") as f:
+                    for u in range(u0, u1 + 1):
+                        f.write(run.get(u, bytes(bs)))
+                log("  Strom %02X/%d: %d Datenbloecke ohne Dateikopf%s -> %s" %
+                    (A, sub, len(run),
+                     ", Dateiende empfangen" if end == u1 + 1 else "",
+                     os.path.basename(path)))
         if other:
             log("  Strom %02X/%d: andere Pakettypen %s" %
                 (A, sub, ", ".join("%02X:%d" % kv for kv in sorted(other.items()))))
+
+    # Dateien schreiben (gleichnamige, aber verschiedene Dateien bekommen
+    # einen Zaehler angehaengt)
+    used = collections.Counter()
+    conflicts = 0
+    for (name, size, mtime), f in files.items():
+        data = bytearray()
+        missing = 0
+        for i in range(f["nblk"]):
+            cnt = f["blocks"].get(i)
+            blk = None
+            if cnt:
+                blk = cnt.most_common(1)[0][0]
+                if len(cnt) > 1:
+                    conflicts += 1
+            if blk is None:
+                missing += 1
+                blk = bytes(f["blksz"])
+            data += blk[:f["blksz"]].ljust(f["blksz"], b"\0")
+        data = data[:size]
+        complete = missing == 0 and len(data) == size
+        used[(f["A"], name.lower())] += 1
+        fname = name
+        if used[(f["A"], name.lower())] > 1:
+            stem, ext = os.path.splitext(name)
+            fname = "%s_%d%s" % (stem, used[(f["A"], name.lower())], ext)
+        path = None
+        if complete or keep_partial:
+            if not complete:
+                fname += ".unvollstaendig"
+            sd = os.path.join(outdir, "strom_%02X" % f["A"])
+            os.makedirs(sd, exist_ok=True)
+            path = os.path.join(sd, fname)
+            with open(path, "wb") as fh:
+                fh.write(data)
+            if mtime:
+                try:
+                    t = mtime.timestamp()
+                    os.utime(path, (t, t))
+                except (OverflowError, OSError, ValueError):
+                    pass
+        results.append((f["A"], name, size, missing, f["nblk"], path,
+                        f["count"]))
+    if n_rescued:
+        log("  %d defekte Dateikoepfe repariert" % n_rescued)
+    if conflicts:
+        log("  %d Dateibloecke lagen in abweichenden Versionen vor "
+            "(Mehrheitsentscheid)" % conflicts)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Andere Dienste (neben der Dateiuebertragung)
+#
+# Durch Analyse einer Aufnahme vom 11.04.1993 rekonstruiert:
+#   Strom 01 Typ 06  Uhrzeit: 06 JJ MM TT hh mm ss 00, alle 5 Sekunden
+#   Strom 01 Typ 05  127 Byte Nutzdaten, jedes 2. Byte nur 7 Bit, sonst
+#                    zufaellig verteilt -> verschluesselt (15-Bit-Werte),
+#                    pausiert, wenn Unterkanal 1 eine Sendung uebertraegt
+#   Strom 03 Typ 07  verschluesselt in 8-Byte-Bloecken (gleiche Klartext-
+#                    bloecke ergeben gleiche Geheimtextbloecke, ECB-artig);
+#                    ca. 30 verschiedene Pakete im Umlauf
+#   Strom 03 Typ 0A  16 Byte, stets gleich, alle ~2,5 Minuten
+#   Strom 00 Typ 00  Bitlisten in 32-Byte-Bloecken:
+#                    00 [Liste] [Block LE16] 00 [Anzahl LE16] Daten
+#                    Daten komprimiert: 00 n = n Nullbytes, FF n = n FF-
+#                    Bytes, sonst Byte unveraendert. Liste 00 und 11 haben
+#                    genau 65536 Bit; die Listen 03/10/11 sind (fast)
+#                    Teilmengen von Liste 00 -> vermutlich Freischaltung je
+#                    Dienst, ein Bit pro Decoder-/Teilnehmernummer.
+#   Strom 00 Typ 01/02/81/82  Steuermeldung [Typ][Strom]: 82/81 = Beginn/
+#                    Ende einer Sendung im Unterkanal 1 (z.B. 82 94, 81 F5),
+#                    02/01 entsprechend im Unterkanal 0 (Bedeutung unsicher)
+#   In Sendungsstroemen (Unterkanal 1):
+#     Typ 00  Sendungskopf: 00 [DOS-Zeit 4] [2 Byte] [Laenge] [Kennung]
+#     Typ 01  Sendungsende: 01 [DOS-Zeit 4] ...
+# ---------------------------------------------------------------------------
+def _unrun(b):
+    out = bytearray()
+    i = 0
+    while i < len(b):
+        if b[i] in (0x00, 0xFF):
+            if i + 1 >= len(b):
+                break
+            out += bytes([b[i]]) * b[i + 1]
+            i += 2
+        else:
+            out.append(b[i])
+            i += 1
+    return out
+
+
+def _dos_dt(b):
+    t, d = struct.unpack("<HH", bytes(b[:4]))
+    try:
+        return datetime.datetime(1980 + (d >> 9), (d >> 5) & 15, d & 31,
+                                 t >> 11, (t >> 5) & 63, (t & 31) * 2)
+    except ValueError:
+        return None
+
+
+class Uhr:
+    """Bytepositionen -> Uhrzeit, aus den Uhrzeit-Paketen."""
+
+    def __init__(self, ticks):
+        self.t = sorted(ticks)                     # (pos, datetime)
+        rates = []
+        for (p0, t0), (p1, t1) in zip(self.t, self.t[1:]):
+            dt = (t1 - t0).total_seconds()
+            if 0 < dt <= 30:
+                rates.append((p1 - p0) / dt)
+        self.rate = float(np.median(rates)) if rates else None
+
+    def __call__(self, pos):
+        if not self.t or not self.rate:
+            return None
+        i = int(np.searchsorted([p for p, _ in self.t], pos))
+        cand = [self.t[k] for k in (i - 1, i) if 0 <= k < len(self.t)]
+        p, t = min(cand, key=lambda c: abs(c[0] - pos))
+        return t + datetime.timedelta(seconds=(pos - p) / self.rate)
+
+    def schnitte(self):
+        """Luecken der Aufnahme: Uhr springt weiter als die Bytes erlauben."""
+        out = []
+        for (p0, t0), (p1, t1) in zip(self.t, self.t[1:]):
+            dt = (t1 - t0).total_seconds()
+            erwartet = (p1 - p0) / self.rate
+            if dt - erwartet > 30 or dt < 0:
+                out.append((p0, t0, t1, dt - erwartet))
+        return out
+
+
+def analyse_dienste(pk, outdir, log):
+    ok = [x for x in pk if x.ok and x.pay]
+    os.makedirs(outdir, exist_ok=True)
+    rep = []
+    w = rep.append
+    hm = lambda t: t.strftime("%H:%M:%S") if t else "?"
+
+    # --- Uhrzeit --------------------------------------------------------
+    ticks = []
+    for x in ok:
+        p = x.pay
+        if x.A == 0x01 and p[0] == 0x06 and len(p) == 8:
+            try:
+                ticks.append((x.pos, datetime.datetime(
+                    1900 + p[1], p[2], p[3], p[4], p[5], p[6])))
+            except ValueError:
+                pass
+    # Ausreisser (falsche Pruefsumme durchgerutscht) entfernen
+    ticks.sort()
+    gut = []
+    for k, (pos, t) in enumerate(ticks):
+        nb = [tt for _, tt in ticks[max(0, k - 3):k + 4] if tt is not t]
+        if sum(abs((t - tt).total_seconds()) < 900 for tt in nb) >= \
+                min(2, len(nb)):
+            gut.append((pos, t))
+    uhr = Uhr(gut)
+    w("UHRZEIT (Strom 01, Typ 06)")
+    if gut:
+        w("  %d Zeitstempel, %s bis %s%s" %
+          (len(gut), gut[0][1].strftime("%d.%m.%Y %H:%M:%S"),
+           gut[-1][1].strftime("%H:%M:%S"),
+           ", %.0f Bytes/s" % uhr.rate if uhr.rate else ""))
+        for p0, t0, t1, fehl in uhr.schnitte():
+            w("  Aufnahmeluecke bei Byte %d: %s -> %s (ca. %d s fehlen)" %
+              (p0, hm(t0), hm(t1), fehl))
+    else:
+        w("  keine Uhrzeit-Pakete gefunden")
+
+    # --- Sendungsablauf ---------------------------------------------------
+    w("")
+    w("SENDUNGSABLAUF")
+    ereig = []
+    for x in ok:
+        p = x.pay
+        if x.A == 0x00 and p[0] in (0x01, 0x02, 0x81, 0x82) and len(p) == 8:
+            art = {0x82: "Beginn", 0x81: "Ende", 0x02: "Beginn?",
+                   0x01: "Ende?"}[p[0]]
+            ereig.append((x.pos, "Steuerung: %-7s Strom %02X" % (art, p[1])))
+        elif x.B & 0x80 and p[0] == 0x00 and len(p) > 9:
+            n = p[7]
+            name = bytes(p[8:8 + n]).decode("cp437", "replace").strip()
+            ereig.append((x.pos, "Strom %02X Sendungskopf '%s', Sendezeit %s"
+                          % (x.A, name, hm(_dos_dt(p[1:5])))))
+        elif x.B & 0x80 and p[0] == 0x01 and len(p) == 8:
+            ereig.append((x.pos, "Strom %02X Sendungsende, Zeit %s" %
+                          (x.A, hm(_dos_dt(p[1:5])))))
+    letzte = None
+    for pos, txt in sorted(ereig):
+        if txt == letzte:
+            continue                      # Wiederholung desselben Pakets
+        letzte = txt
+        w("  %s  %s" % (hm(uhr(pos)), txt))
+    w("")
+    w("  Aktive Datenstroeme (Dateiuebertragung):")
+    akt = collections.defaultdict(list)
+    for x in ok:
+        if x.A != 0x00 and x.pay[0] in (0x02, 0x03, 0x04, 0x0C):
+            akt[(x.A, x.B >> 7)].append(x.pos)
+    for (A, sub), ps in sorted(akt.items()):
+        if len(ps) < 3:
+            continue
+        w("    Strom %02X/%d: %s - %s, %d Pakete" %
+          (A, sub, hm(uhr(min(ps))), hm(uhr(max(ps))), len(ps)))
+
+    # --- Bitlisten ----------------------------------------------------
+    W = 32
+    lists = collections.defaultdict(dict)
+    for x in ok:
+        p = x.pay
+        if x.A == 0x00 and p[0] == 0x00 and len(p) >= 16:
+            blk = p[2] | p[3] << 8
+            n = p[5] | p[6] << 8
+            u = _unrun(p[7:])
+            for k in range(n):
+                seg = bytes(u[k * W:(k + 1) * W])
+                if len(seg) == W:
+                    lists[p[1]].setdefault(blk + k,
+                                           collections.Counter())[seg] += 1
+    w("")
+    w("BITLISTEN (Strom 00, Typ 00) - vermutlich Freischaltung je Dienst,")
+    w("ein Bit je Decoder-/Teilnehmernummer (Bit 7 des ersten Bytes = Nr. 0)")
+    bits = {}
+    for lid, d in sorted(lists.items()):
+        H = max(d) + 1
+        data = b"".join(d[y].most_common(1)[0][0] if y in d else bytes(W)
+                        for y in range(H))
+        fehl = H - len(d)
+        b = np.unpackbits(np.frombuffer(data, np.uint8))
+        bits[lid] = b
+        name = "bitliste_%02X.bin" % lid
+        open(os.path.join(outdir, name), "wb").write(data)
+        nz = np.nonzero(b)[0]
+        w("  Liste %02X: %d Bit (%d Bloecke, %d fehlen), %d gesetzt, "
+          "Nummern %s -> %s" %
+          (lid, len(b), H, fehl, len(nz),
+           ("%d-%d" % (nz[0], nz[-1])) if len(nz) else "-", name))
+        try:
+            from PIL import Image
+            h = (len(b) + 255) // 256
+            img = np.zeros(h * 256, np.uint8)
+            img[:len(b)] = b * 255
+            Image.fromarray(255 - img.reshape(h, 256)).save(
+                os.path.join(outdir, "bitliste_%02X.png" % lid))
+        except ImportError:
+            pass
+    if 0x00 in bits:
+        null = bits[0x00] == 0
+        nz = np.nonzero(null)[0]
+        if len(nz):
+            w("    Liste 00: %d Nummern NICHT gesetzt (%d-%d); davon in anderen "
+              "Listen: %s -> Liste 00 wirkt wie eine Sperrliste "
+              "(0 = gesperrt)" % (len(nz), nz[0], nz[-1], ", ".join(
+                  "%02X: %d" % (k, int((bits[k][:len(null)] &
+                                        null[:len(bits[k])]).sum()))
+                  for k in sorted(bits) if k)))
+    for a in sorted(bits):
+        for c in sorted(bits):
+            if a == c:
+                continue
+            n = min(len(bits[a]), len(bits[c]))
+            ba, bc = bits[a][:n], bits[c][:n]
+            if ba.sum() and (ba & ~bc).sum() <= 0.1 * ba.sum():
+                w("    Liste %02X ist (fast) Teilmenge von Liste %02X "
+                  "(%d von %d Bit ausserhalb)" %
+                  (a, c, int((ba & ~bc).sum()), int(ba.sum())))
+
+    # --- verschluesselte / unbekannte Dienste ------------------------------
+    w("")
+    w("WEITERE DIENSTE (Rohdaten in dienst_*.bin)")
+    gruppen = collections.defaultdict(list)
+    for x in ok:
+        p = x.pay
+        if (x.A, p[0]) in ((0x01, 0x05), (0x03, 0x07), (0x03, 0x0A)):
+            gruppen[(x.A, p[0])].append(x)
+    texte = {(0x01, 0x05): "verschluesselt; jedes 2. Byte 7 Bit (15-Bit-"
+             "Werte), keine Wiederholungen",
+             (0x03, 0x07): "verschluesselt in 8-Byte-Bloecken (ECB-artig), "
+             "Pakete werden zyklisch wiederholt",
+             (0x03, 0x0A): "kurzes Steuerpaket, stets gleich"}
+    for (A, t), xs in sorted(gruppen.items()):
+        verschieden = collections.OrderedDict()
+        for x in xs:
+            verschieden.setdefault(bytes(x.pay), []).append(x.pos)
+        name = "dienst_%02X_typ%02X.bin" % (A, t)
+        with open(os.path.join(outdir, name), "wb") as f:
+            for pay in verschieden:
+                f.write(struct.pack("<H", len(pay)) + pay)
+        w("  Strom %02X Typ %02X: %d Pakete, %d verschieden, %s - %s; %s"
+          " -> %s" % (A, t, len(xs), len(verschieden), hm(uhr(xs[0].pos)),
+                      hm(uhr(xs[-1].pos)), texte[(A, t)], name))
+    w("  (Format der .bin: je Paket 2 Byte Laenge LE + Nutzlast)")
+    with open(os.path.join(outdir, "dienste.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("\n".join(rep) + "\n")
+    log("")
+    for line in rep:
+        log(line)
+    return uhr
 
 
 def main():
@@ -603,6 +1155,9 @@ def main():
     ap.add_argument("--partial", action="store_true",
                     help="unvollstaendige Dateien trotzdem schreiben "
                     "(fehlende Bloecke = Nullbytes)")
+    ap.add_argument("--keine-dienste", action="store_true",
+                    help="andere Dienste (Uhrzeit, Sendungsablauf, Bitlisten, "
+                    "verschluesselte Daten) nicht auswerten")
     ap.add_argument("--dump-other", action="store_true",
                     help="Pakete anderer Dienste roh ablegen")
     args = ap.parse_args()
@@ -633,11 +1188,16 @@ def main():
     res = assemble(pk, args.outdir, args.partial, args.dump_other, log)
     log("")
     log("Dateien:")
-    for A, name, size, missing, nblk, path in res:
+    for A, name, size, missing, nblk, path, count in res:
         st = "vollstaendig" if missing == 0 else \
             "unvollstaendig (%d von %d Bloecken fehlen)" % (missing, nblk)
-        log("  Strom %02X  %-14s %8d Bytes  %s%s" %
-            (A, name, size, st, "" if path else "  [nicht geschrieben]"))
+        rep = "  (%dx gesendet)" % count if count > 1 else ""
+        log("  Strom %02X  %-14s %8d Bytes  %s%s%s" %
+            (A, name, size, st, rep, "" if path else "  [nicht geschrieben]"))
+    n_ok = sum(1 for r in res if r[3] == 0)
+    log("%d Dateien, davon %d vollstaendig" % (len(res), n_ok))
+    if not args.keine_dienste:
+        analyse_dienste(pk, os.path.join(args.outdir, "dienste"), log)
 
 
 if __name__ == "__main__":
