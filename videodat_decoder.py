@@ -87,12 +87,11 @@ FMT_BTTV = Fmt(35.46895e6, (16, 100), (100, 0x180), 30)
 FMT_TBC_PAL = Fmt(17.734475e6, (100, 190), (150, 400), 3000)
 
 
-def slice_line(l, fmt=FMT_BTTV, prior=None):
-    """Eine VBI-Zeile -> (10 Bytes, 80 Bit-Sicherheiten) oder None.
+def line_phase(l, fmt=FMT_BTTV, prior=None):
+    """Startflanke einer VBI-Zeile -> (e0, Schwelle, lo, hi) oder None.
 
     prior: erwartete Position der Startflanke (z.B. aus dem H-Sync);
-    ohne prior wird die erste steigende Flanke gesucht.
-    Sicherheit = (Abtastwert - Schwelle) / Hub, >0 bedeutet 'hell'."""
+    ohne prior wird die erste steigende Flanke gesucht."""
     l = np.asarray(l, dtype=float)
     spb = fmt.spb
     n = len(l)
@@ -123,7 +122,33 @@ def slice_line(l, fmt=FMT_BTTV, prior=None):
         e0 += ph * spb / (2 * np.pi)
     if not np.isfinite(e0) or e0 < 0 or e0 + 100 * spb >= n - 1:
         return None
-    x = e0 + (np.arange(10)[:, None] * 10 + 1.5 + np.arange(8)[None, :]) * spb
+    return e0, thr, lo, hi
+
+
+def framing(l, ph, fmt):
+    """Anzahl korrekter Start-/Stopbits (0..20) einer Zeile mit Phase ph
+    (aus line_phase). Start- und Stopbit haben in jedem Byte entgegen-
+    gesetzten Pegel; zufaellige Signale erreichen selten mehr als 15."""
+    e0, thr = ph[0], ph[1]
+    k = np.arange(10) * 10
+    st = l[(e0 + (k + 0.5) * fmt.spb).astype(int)] >= thr
+    sp = l[(e0 + (k + 9.5) * fmt.spb).astype(int)] >= thr
+    a = int(st.sum()) + int((~sp).sum())
+    return max(a, 20 - a)
+
+
+def slice_line(l, fmt=FMT_BTTV, prior=None):
+    """Eine VBI-Zeile -> (10 Bytes, 80 Bit-Sicherheiten) oder None.
+
+    prior: siehe line_phase.
+    Sicherheit = (Abtastwert - Schwelle) / Hub, >0 bedeutet 'hell'."""
+    l = np.asarray(l, dtype=float)
+    ph = line_phase(l, fmt, prior)
+    if ph is None:
+        return None
+    e0, thr, lo, hi = ph
+    spb = fmt.spb
+    x = e0 +(np.arange(10)[:, None] * 10 + 1.5 + np.arange(8)[None, :]) * spb
     ia = x.astype(int)
     f = x - ia
     v = l[ia] * (1 - f) + l[ia + 1] * f
@@ -211,7 +236,195 @@ def tbc_field_order(path, nf):
     return None
 
 
-def read_tbc(path, width, field_lines, lines, use_sync, log):
+def detect_tbc_lines(F, order, nf, max_fields, log, maxline=40,
+                     block=50, need=100, stable_blocks=5):
+    """VideoDat-Zeilen je Halbbild-Paritaet finden.
+
+    Kriterium ist die Byte-Rahmung (Start-/Stopbit in allen 10 Bytes,
+    hoechstens 2 Fehler), nicht das Sync-Wort: 56 AE liegt nur selten
+    vollstaendig in einer Zeile, und in gestoerten Aufnahmen reichten die
+    wenigen Treffer am Anfang nicht aus. Gesucht wird blockweise (1 s),
+    bis beide Paritaeten genug Treffer haben und sich die Auswahl
+    stable_blocks Bloecke lang nicht mehr aendert, hoechstens max_fields
+    Halbbilder.
+    Rueckgabe: (Zeilenmengen je Paritaet, Liste H-Sync-Offsets aus
+    einwandfrei gerahmten Zeilen)."""
+    score = [np.zeros(maxline, int), np.zeros(maxline, int)]
+    offs = []
+
+    def select(sc):
+        best = sc.max()
+        if best < 10:
+            return frozenset()
+        return frozenset(int(k) for k in np.nonzero(sc >= best * 0.3)[0])
+
+    last, stable, end = None, 0, min(nf, max_fields)
+    for b0 in range(0, end, block):
+        for fi in range(b0, min(b0 + block, end)):
+            par = 0 if order[fi] else 1
+            rows = np.asarray(F[fi, :maxline], dtype=float)
+            for li in range(min(maxline, len(rows))):
+                l = rows[li]
+                ph = line_phase(l, FMT_TBC_PAL)
+                if ph is None:
+                    continue
+                q = framing(l, ph, FMT_TBC_PAL)
+                if q >= 18:
+                    score[par][li] += 1
+                if q == 20:
+                    s = hsync_end(l)
+                    if s is not None:
+                        offs.append((par, li, ph[0] - s))
+        sets = [select(score[0]), select(score[1])]
+        if min(score[0].max(), score[1].max()) >= need and sets == last:
+            stable += 1
+        else:
+            stable = 0
+        last = sets
+        if stable >= stable_blocks:
+            break
+    t = min(b0 + block, end)
+    log("Zeilensuche ueber %d Halbbilder (%.1f s), Treffer je Zeile: %s" %
+        (t, t / 50.0, ", ".join(
+            "%d:%d" % (li + 1 + 313 * p, score[p][li])
+            for p in (0, 1) for li in sorted(last[p]))))
+    for p in (0, 1):
+        if not last[p]:
+            log("WARNUNG: im %d. Halbbild keine VideoDat-Zeile gefunden "
+                "(ggf. --lines angeben oder --scan-seconds erhoehen)" % (p + 1))
+    offs = [o for p, li, o in offs if li in last[p]]
+    return [set(last[0]), set(last[1])], offs
+
+
+# Entzerrer fuer TBC-Zeilen. Analyse einer LP-Aufnahme (tape304): Die
+# 0-Bits liegen bei -0,6, die 1-Bits nur bei +0,3..+0,5 (bezogen auf
+# (lo+hi)/2 und den Hub), isolierte 1-Bits sind am schwaechsten
+# (Intersymbol-Interferenz), und fast alle Restfehler sind gelesene 0 statt 1
+# (Einbrueche im hellen Pegel). Daher:
+#   - Schwelle je Zeile aus den Mittelwerten beider Pegel (2-Means),
+#   - linearer Entzerrer (9 Abtastwerte im Abstand 1/2 Bit), per kleinste
+#     Quadrate aus Zeilen fehlerfreier Pakete der Aufnahme selbst gelernt,
+#   - Entscheidungsschwelle zugunsten '1' verschoben; die Verschiebung wird
+#     so gewaehlt, dass im Lernabschnitt die meisten Pruefsummen stimmen.
+# Gegenueber der festen Schwelle (lo+hi)/2 ergab das in tape304 je nach
+# Abschnitt 40..100 % mehr fehlerfreie Pakete.
+EQ_TAPS = np.arange(-4, 5) * 0.5          # Abtastpunkte relativ zur Bitmitte
+
+
+def tbc_features(l, ph, fmt=FMT_TBC_PAL):
+    """Abtastwerte um jede der 100 Bitmitten (Start-/Daten-/Stopbits),
+    normiert mit der 2-Means-Schwelle -> Matrix (100, len(EQ_TAPS)+1)."""
+    e0, thr, lo, hi = ph
+    x = e0 + (np.arange(100)[:, None] + 0.5 + EQ_TAPS[None, :]) * fmt.spb
+    x = np.clip(x, 0, len(l) - 2)
+    ia = x.astype(int)
+    f = x - ia
+    s = l[ia] * (1 - f) + l[ia + 1] * f
+    c = s[:, len(EQ_TAPS) // 2]
+    t = thr
+    for _ in range(5):
+        a, b = c[c < t], c[c >= t]
+        if not len(a) or not len(b):
+            break
+        t = (a.mean() + b.mean()) / 2
+    return np.hstack([(s - t) / (hi - lo), np.ones((100, 1))])
+
+
+class Equalizer:
+    def __init__(self, w, bias):
+        self.w, self.bias = w, bias
+
+    def soft100(self, X):
+        return X @ self.w + self.bias
+
+
+def soft100_to_line(y):
+    """100 Sicherheiten (inkl. Start-/Stopbits) -> (10 Bytes, 80 Sicherh.)"""
+    soft = np.asarray(y, np.float32).reshape(10, 10)[:, 1:9]
+    out = (np.packbits(soft >= 0, axis=1, bitorder="little")[:, 0] ^ 0xFF)
+    return out.tobytes(), soft.reshape(-1)
+
+
+def slice_tbc(l, prior=None, eq=None):
+    """TBC-Zeile -> (10 Bytes, 80 Bit-Sicherheiten) oder None.
+    Ohne Entzerrer: 2-Means-Schwelle in der Bitmitte."""
+    l = np.asarray(l, dtype=float)
+    ph = line_phase(l, FMT_TBC_PAL, prior)
+    if ph is None:
+        return None
+    X = tbc_features(l, ph)
+    y = eq.soft100(X) if eq is not None else X[:, len(EQ_TAPS) // 2]
+    return soft100_to_line(y)
+
+
+def _good_lines(stream, nlines):
+    """Zeilen, die vollstaendig in Paketen mit richtiger Pruefsumme liegen,
+    und Anzahl dieser Pakete."""
+    good = np.zeros(nlines, bool)
+    n = 0
+    for x in find_packets(stream):
+        if x.ok:
+            good[-(-x.pos // 10):(x.pos + len(x.raw)) // 10] = True
+            n += 1
+    return good, n
+
+
+def train_equalizer(F, order, sets, offset, start, nf, log,
+                    chunk=2500, max_fields=30000, need=3000):
+    """Entzerrer aus der Aufnahme lernen (ab Halbbild start).
+    Liest Abschnitte zu chunk Halbbildern, bis need fehlerfreie Zeilen
+    vorliegen (hoechstens max_fields). Rueckgabe Equalizer oder None."""
+    X, good, n_simple = [], np.zeros(0, bool), 0
+    end = min(nf, start + max_fields)
+    fi = start
+    while fi < end:
+        for fj in range(fi, min(fi + chunk, end)):
+            for li in sorted(sets[0 if order[fj] else 1]):
+                l = np.asarray(F[fj, li], dtype=float)
+                prior = None
+                if offset is not None:
+                    s = hsync_end(l)
+                    if s is not None:
+                        prior = s + offset
+                ph = line_phase(l, FMT_TBC_PAL, prior)
+                if ph is not None:
+                    X.append(tbc_features(l, ph))
+        fi = min(fi + chunk, end)
+        st = Stream()
+        for Xi in X:
+            st.add(soft100_to_line(Xi[:, len(EQ_TAPS) // 2]))
+        good, n_simple = _good_lines(st.finish(), len(X))
+        if good.sum() >= need:
+            break
+    if good.sum() < 200:
+        log("Entzerrer: zu wenige fehlerfreie Zeilen (%d), verwende "
+            "einfache Schwelle" % good.sum())
+        return None
+    A = np.vstack([X[i] for i in np.nonzero(good)[0]])
+    Y = np.where(A[:, len(EQ_TAPS) // 2] >= 0, 1.0, -1.0)
+    w = np.linalg.lstsq(A, Y, rcond=None)[0]
+    # Schwellenverschiebung: meiste Pruefsummen im Lernabschnitt
+    Yall = np.stack([Xi @ w for Xi in X])
+    biases = np.round(np.arange(0, 0.75, 0.05), 2)
+    hits = []
+    for b in biases:
+        st = Stream()
+        for y in Yall:
+            st.add(soft100_to_line(y + b))
+        hits.append(sum(x.ok for x in find_packets(st.finish())))
+    hits = np.array(hits, float)
+    # leicht geglaettet: das Optimum faellt zu grossen Werten steil ab
+    sm = np.convolve(np.pad(hits, 1, mode="edge"), np.ones(3) / 3, "valid")
+    k = int(np.argmax(sm))
+    log("Entzerrer aus %d fehlerfreien Zeilen (Halbbilder %d-%d) gelernt, "
+        "Schwellenverschiebung %.2f: %d statt %d fehlerfreie Pakete im "
+        "Lernabschnitt" % (good.sum(), start, fi, biases[k], hits[k],
+                           n_simple))
+    return Equalizer(w, float(biases[k]))
+
+
+def read_tbc(path, width, field_lines, lines, use_sync, log,
+             scan_seconds=30.0, use_eq=True):
     raw = np.memmap(path, dtype="<u2", mode="r")
     fsz = width * field_lines
     nf = len(raw) // fsz
@@ -227,49 +440,47 @@ def read_tbc(path, width, field_lines, lines, use_sync, log):
         return f1, f2
 
     # 1) Zeilen bestimmen (Halbbild-Zeilenindex)
+    max_fields = int(scan_seconds * 50)
     if lines is None:
-        cnt = [collections.Counter(), collections.Counter()]
-        for fi in range(min(nf, 150)):
-            par = 0 if order[fi] else 1
-            for li in range(min(40, field_lines)):
-                r = slice_line(F[fi, li], FMT_TBC_PAL)
-                if r is not None and SYNC in r[0]:
-                    cnt[par][li] += 1
-        sets = []
-        for c in cnt:
-            best = max(c.values()) if c else 0
-            sets.append({k for k, v in c.items() if v >= best * 0.2})
+        sets, offs = detect_tbc_lines(F, order, nf, max_fields, log,
+                                      maxline=min(40, field_lines))
         log("VideoDat-Zeilen (automatisch, Bildzeilen PAL): %s" %
             (sorted(k + 1 for k in sets[0]) + sorted(k + 314 for k in sets[1])))
     else:
         sets = list(idx_sets_from_frame_lines(lines))
+        offs = None
 
-    # 2) Abstand H-Sync -> Startflanke lernen
+    # 2) Abstand H-Sync -> Startflanke lernen (nur aus einwandfrei
+    # gerahmten Zeilen; gestoerte Zeilen am Aufnahmeanfang verfaelschen
+    # sonst den Wert)
     offset = None
     if use_sync:
-        offs = []
-        for fi in range(min(nf, 100)):
-            for li in sorted(sets[0 if order[fi] else 1]):
-                l = np.asarray(F[fi, li], dtype=float)
-                s = hsync_end(l)
-                r = slice_line(l, FMT_TBC_PAL)
-                if s is None or r is None:
-                    continue
-                # Startflanke aus erster Flanke
-                lo = np.median(l[100:190])
-                hi = np.percentile(l[150:1100], 90)
-                thr = (lo + hi) / 2
-                p = 151
-                while p < 400 and not (l[p - 1] < thr <= l[p]):
-                    p += 1
-                if p < 400:
-                    offs.append(p - 1 + (thr - l[p - 1]) / (l[p] - l[p - 1]) - s)
+        if offs is None:
+            offs = []
+            for fi in range(min(nf, max_fields)):
+                for li in sorted(sets[0 if order[fi] else 1]):
+                    l = np.asarray(F[fi, li], dtype=float)
+                    ph = line_phase(l, FMT_TBC_PAL)
+                    s = hsync_end(l)
+                    if ph is not None and s is not None and \
+                            framing(l, ph, FMT_TBC_PAL) == 20:
+                        offs.append(ph[0] - s)
+                if len(offs) >= 500:
+                    break
         if len(offs) >= 10:
             offset = float(np.median(offs))
             log("Startflanke %.2f Samples nach H-Sync-Rueckflanke "
                 "(Streuung %.2f)" % (offset, float(np.std(offs))))
 
-    # 3) dekodieren
+    # 3) Entzerrer lernen (ab Ende der Zeilensuche, dort ist das Signal
+    # i.d.R. stabil)
+    eq = None
+    if use_eq:
+        eq = train_equalizer(F, order, sets, offset,
+                             min(max_fields, nf // 2) if lines is None else 0,
+                             nf, log)
+
+    # 4) dekodieren
     st = Stream()
     nsync = 0
     for fi in range(nf):
@@ -281,7 +492,7 @@ def read_tbc(path, width, field_lines, lines, use_sync, log):
                 if s is not None:
                     prior = s + offset
                     nsync += 1
-            r = slice_line(l, FMT_TBC_PAL, prior)
+            r = slice_tbc(l, prior, eq)
             if r is not None:
                 st.add(r)
     log("%d Halbbilder, %d Datenzeilen (%d mit H-Sync-Bezug) -> %d Bytes" %
@@ -1164,6 +1375,12 @@ def main():
                     help="TBC: Zeilen pro Halbbild (PAL 313)")
     ap.add_argument("--no-sync", action="store_true",
                     help="TBC: H-Sync nicht als Zeitbezug verwenden")
+    ap.add_argument("--no-eq", action="store_true",
+                    help="TBC: keinen Entzerrer lernen (nur adaptive Schwelle)")
+    ap.add_argument("--scan-seconds", type=float, default=30.0,
+                    help="TBC: Zeilensuche hoechstens ueber so viele Sekunden "
+                    "vom Aufnahmeanfang (bricht frueher ab, sobald die "
+                    "Zeilen sicher erkannt sind)")
     ap.add_argument("-o", "--outdir", default="videodat1993_out")
     ap.add_argument("--bytes", action="store_true",
                     help="Eingabe ist ein Byte-Strom (10 Byte je Zeile)")
@@ -1193,7 +1410,8 @@ def main():
         stream = open(args.input, "rb").read()
     elif fmt == "tbc":
         stream = read_tbc(args.input, args.tbc_width, args.tbc_field_lines,
-                          lines, not args.no_sync, log)
+                          lines, not args.no_sync, log, args.scan_seconds,
+                          not args.no_eq)
     else:
         stream = read_vbi(args.input, args.line_length, args.lines_per_frame,
                           lines, log)
