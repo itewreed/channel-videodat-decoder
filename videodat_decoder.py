@@ -535,6 +535,28 @@ def dos_time(v):
         return None
 
 
+def chvd_kopf(b):
+    """Kopf einer Kaufsoftware-Datei ('CHVDFILE', 32 Bytes), wie sie der
+    ShareShop des CHANNEL VIDEODAT Ende 1993 verschickte:
+       0  'CHVDFILE'
+       8  04          Version
+       9  ..          unbekannt (je Datei verschieden)
+      10  20          DOS-Dateiattribut (Archiv)
+      11  uint16 Zeit, uint16 Datum (DOS) der enthaltenen Datei
+      15  uint32      Laenge der enthaltenen Datei
+      19  '!' Name\\0 (Rest bis Byte 31 ohne Bedeutung)
+      32  Inhalt, verschluesselt in 8-Byte-Bloecken (Laenge auf 8
+          aufgerundet); lesbar nur mit der Empfangssoftware und
+          einer KontoDisk, mit der die Software bezahlt wurde.
+    Rueckgabe dict oder None."""
+    if len(b) < 32 or b[:8] != b"CHVDFILE":
+        return None
+    t, d, n = struct.unpack_from("<HHI", b, 11)
+    name = b[20:32].split(b"\0")[0].decode("ascii", "replace")
+    return dict(version=b[8], name=name, laenge=n, zeit=dos_time(d << 16 | t),
+                bloecke8=(n + 7) // 8)
+
+
 def safe_name(b):
     n = b.split(b"\0")[0].decode("cp437", "replace")
     n = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", n).strip(" .")
@@ -1194,6 +1216,15 @@ def main():
         rep = "  (%dx gesendet)" % count if count > 1 else ""
         log("  Strom %02X  %-14s %8d Bytes  %s%s%s" %
             (A, name, size, st, rep, "" if path else "  [nicht geschrieben]"))
+        if path:
+            with open(path, "rb") as fh:
+                k = chvd_kopf(fh.read(32))
+            if k:
+                z = k["zeit"]
+                log("            Kaufsoftware (CHVDFILE): enthaelt %s, %d Bytes"
+                    "%s, verschluesselt" %
+                    (k["name"], k["laenge"],
+                     z.strftime(" vom %d.%m.%Y %H:%M") if z else ""))
     n_ok = sum(1 for r in res if r[3] == 0)
     log("%d Dateien, davon %d vollstaendig" % (len(res), n_ok))
     if not args.keine_dienste:
