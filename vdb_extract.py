@@ -11,21 +11,29 @@ Aufbau einer .VDB (durch Analyse rekonstruiert):
     4  uint16  0
     6  uint16  Satznummer
     8  uint32  Flags (oberes Byte: 00 Bild, 01 Seite/Text, 02 Programm-
-               eintrag; 00100000 bei Satz 1 = Seitenfolge)
+               eintrag, 04 Begleitdokument; 00100000 bei Satz 1 =
+               Seitenfolge)
    12  L Bytes Inhalt:
-        'VDPC'  Bild: Version (00/01), 04 (4 Bitebenen), Breite, Hoehe
-                (je uint16), danach die Bilddaten zeilenweise je 4 Ebenen zu
-                ceil(Breite/8) Bytes, 16 Farben (EGA-Standardpalette).
+        'VDPC'  Bild: Version (00/01), Zahl der Bitebenen (04 = 16 Farben,
+                01 = einfarbig), Breite, Hoehe (je uint16), danach die
+                Bilddaten zeilenweise je Ebene ceil(Breite/8) Bytes,
+                EGA-Standardpalette.
                 Version 00: PCX-Lauflaengen (Byte >= C0: Anzahl = Byte & 3F,
-                naechstes Byte = Wert). Version 01 (ab Mitte 1993): eigene
-                Lauflaengen fuer 00/FF-Bytes, Ebenen invertiert (rle2_decode).
+                naechstes Byte = Wert). Version 01 (ab Mitte 1993): GEM-IMG-
+                artig mit Zeilenwiederholung und Musterlaeufen, Ebenen
+                invertiert (rle2_decode). Jede Bildzeile beginnt dort mit
+                einem neuen Token; das erlaubt nach Luecken einen exakten
+                Wiedereinstieg am Zeilenanfang.
         'VR'    Bildschirmseite 640x480: Texte + Objektbaum im Stil von
                 GEM-Resourcen (Beschreibung weiter unten bei 'Seite').
         'VT'    Seitenvorlage, gleicher Aufbau, mit Platzhaltern
                 (DDDDDD, NNNNNN, ZZZ, BBBB...).
         Text    Fliesstext (CP437, Zeilenumbruch 0D) fuer Textfelder.
-        94 Byte Programmeintrag: 00 80, Groesse, DOS-Zeit, Kennung,
-                weitere DOS-Zeiten, Titel.
+        94 Byte Programmeintrag: 00 80, Preis (Pfennig) und Groesse (kB)
+                als zwei uint16, DOS-Zeit, Kennung, weitere DOS-Zeiten,
+                Titel.
+        'DT'    Begleitdokument (Text, CP437, CR/LF), z. B. ein Formular;
+                eine Schaltflaeche vom Typ 0x2C auf der Seite druckt es.
         Satz 1  Liste der Seitennummern in Anzeigereihenfolge.
   Die .IDX beginnt mit 'GS' 01, danach je 3 Bytes (little endian) der
   Offset von Satz 1, 2, 3, ... in der .VDB.
@@ -39,11 +47,17 @@ Bildteile werden grau dargestellt.
 
 Aufruf:
   python3 vdb_extract.py DATEI.VDB [weitere Kopien.VDB ...] [DATEI.IDX]
-                         [DATEI.TTL] [-o ausgabeordner] [--palette ega]
+                         [DATEI.TTL] [-o ausgabeordner] [--software ORDNER]
 Ausgabe: inhalt.txt, bild_*.png, text_*.txt, seite_*.png / vorlage_*.png
-(nachgebaute Seiten), seite_*.txt, seiten.html (anklickbare Uebersicht),
-sendungen.txt (Programmliste).
-Benoetigt: numpy, Pillow; fuer die Seiten eine TrueType-Schrift
+(nachgebaute Seiten), seite_*.txt, datei_*.txt (Begleitdokumente),
+seiten.html (anklickbare Uebersicht), sendungen.txt (Programmliste mit
+Preis und Groesse).
+Originalgetreue Seiten: mit --software ORDNER (Programmordner von
+VD 3.3 bzw. WinVideodat 3.2 mit XFONTS, GMICONS.DAT, GM8X16_*.FNT) werden
+die Original-Bitmapschriften und -Symbole verwendet; der Ordner wird auch
+neben der VDB und neben diesem Skript gesucht. Farbtabelle und Fuellmuster
+stammen aus VDGEM.DLL.
+Benoetigt: numpy, Pillow; ohne Originalschriften eine TrueType-Schrift
 (Liberation/DejaVu/Arial, wird automatisch gesucht).
 """
 
@@ -121,7 +135,7 @@ def merge_copies(datas):
 
 
 # Satzarten (oberstes Byte bzw. oberes Halbbyte der Flags)
-FLAG_ARTEN = {0x000, 0x001, 0x010, 0x014, 0x020, 0x800}
+FLAG_ARTEN = {0x000, 0x001, 0x010, 0x014, 0x020, 0x040, 0x800}
 
 
 def record_kind(L, nr, flags, rec):
@@ -138,6 +152,8 @@ def record_kind(L, nr, flags, rec):
         return "liste"
     if flags >> 24 == 1:
         return "text"
+    if flags >> 24 == 4 and rec[:2] == b"DT":
+        return "datei"
     return "unbekannt"
 
 
@@ -215,9 +231,20 @@ def cstr(b, p, maxlen=200):
     return b[p:e if e >= 0 else p + maxlen].decode("cp437", "replace")
 
 
+def preis_groesse(v):
+    """Feld 'Groesse' der Programmeintraege: oberes Wort = Preis in Pfennig
+    (KontoDisk), unteres Wort = Dateigroesse in kB (aufgerundet auf 1000
+    Bytes). Geprueft an acht empfangenen Dateien (Groesse exakt) und an
+    Preisangaben in den Beschreibungstexten (DM 1,00 / 1,50 / 1,99).
+    Rueckgabe (Pfennig oder None, kB)."""
+    if v >= 0x10000:
+        return v >> 16, v & 0xFFFF
+    return None, v
+
+
 def parse_sendung(rec):
-    """94-Byte-Programmeintrag: Groesse (vermutlich KByte), bis zu vier
-    Sendetermine, Kennung und Titel."""
+    """94-Byte-Programmeintrag: Preis und Groesse (siehe preis_groesse),
+    bis zu vier Sendetermine, Kennung und Titel."""
     size = struct.unpack_from("<I", rec, 2)[0]
     zeiten = [z for z in (dos_zeit(rec[p:p + 4]) for p in (6, 39, 43, 47))
               if z]
@@ -326,46 +353,168 @@ def rle_decode(b):
     return out
 
 
-def rle2_decode(b):
-    """Bildkompression Version 1 (VDPC 01 04, ab etwa Mitte 1993):
-    00          ohne Wirkung (Fuellbyte)
+def rle2_decode(b, rowlen):
+    """Bildkompression Version 1 (VDPC 01 xx, ab etwa Mitte 1993), ein
+    GEM-IMG-artiges Verfahren. rowlen = Bytes einer Bildzeile ueber alle
+    Bitebenen (Ebenenzahl * ceil(Breite/8)).
+    00 00 FF k  die folgende Bildzeile (alle Ebenen) steht k+1-mal da
+    00 n p1 p2  Muster p1 p2 n-mal (Raster-/Ditherflaechen)
     01..7F      n Bytes 00
     80 n ...    n Bytes unveraendert uebernehmen
     81..FE      (n-80h) Bytes FF
-    FF k t      Lauf t (wie oben) k-mal
     Die Bitebenen sind invertiert gespeichert; zurueckgegeben werden sie
-    wie bei Version 0 (1 = Bit gesetzt)."""
-    out = bytearray()
-    i, n = 0, len(b)
-    while i < n:
+    wie bei Version 0 (1 = Bit gesetzt). Ueberzaehlige Zeilen am Ende
+    schneidet der Aufrufer ab."""
+    b = bytes(b)
+    n = len(b)
+
+    def lauf(i, dst):
         t = b[i]
+        if t == 0:
+            if i + 3 < n and b[i + 1]:
+                dst += b[i + 2:i + 4] * b[i + 1]
+                return i + 4
+            return i + 1
+        if t == 0x80:
+            m = b[i + 1] if i + 1 < n else 0
+            dst += b[i + 2:i + 2 + m]
+            return i + 2 + m
         if t == 0xFF:
-            if i + 2 >= n:
-                break
-            k, t2 = b[i + 1], b[i + 2]
-            if 0x80 < t2 < 0xFF:
-                out += b"\xff" * ((t2 - 0x80) * k)
-            elif 0 < t2 < 0x80:
-                out += b"\x00" * (t2 * k)
-            i += 3
-        elif t == 0x80:
-            if i + 1 >= n:
-                break
-            m = b[i + 1]
-            out += b[i + 2:i + 2 + m]
-            i += 2 + m
-        elif t > 0x80:
-            out += b"\xff" * (t - 0x80)
-            i += 1
+            return i + 1                 # kommt nicht vor; ueberspringen
+        if t > 0x80:
+            dst += b"\xff" * (t - 0x80)
         else:
-            out += b"\x00" * t
-            i += 1
+            dst += b"\x00" * t
+        return i + 1
+
+    out = bytearray()
+    i = 0
+    while i < n:
+        if b[i] == 0 and i + 3 < n and b[i + 1] == 0 and b[i + 2] == 0xFF:
+            k = b[i + 3]
+            i += 4
+            zeile = bytearray()
+            while len(zeile) < rowlen and i < n:
+                i = lauf(i, zeile)
+            out += bytes(zeile[:rowlen]) * (k + 1)
+            if len(zeile) > rowlen:          # gestoerte Daten: Rest behalten
+                out += zeile[rowlen:]
+        else:
+            i = lauf(i, out)
     return bytearray(x ^ 0xFF for x in out)
+
+
+def _v1_token(b, i, n):
+    """Ein Token der Version-1-Kompression: (naechste Position, Bytes)."""
+    t = b[i]
+    if t == 0:
+        if i + 3 < n and b[i + 1]:
+            return i + 4, 2 * b[i + 1]
+        return i + 1, 0
+    if t == 0x80:
+        m = b[i + 1] if i + 1 < n else 0
+        return i + 2 + m, min(m, max(0, n - i - 2))
+    if t == 0xFF:
+        return i + 1, 0
+    return i + 1, (t - 0x80 if t > 0x80 else t)
+
+
+def v1_zeilenanfang(b, rowlen, bpl=None, mindest=3):
+    """Bei Version 1 beginnt jede Bildzeile mit einem neuen Token (an allen
+    vollstaendigen Bildern geprueft; Ebenengrenzen dagegen nicht). Nach
+    einer Luecke liefert das die genaue Lage innerhalb der Zeile: gesucht
+    ist der Rest modulo rowlen, auf den in jeder Zeile eine Tokengrenze
+    faellt. In gleichfoermigen Bildteilen erfuellen das auch Ebenengrenzen;
+    dann gibt es mehrere Kandidaten. Rueckgabe: Liste der moeglichen
+    Startpositionen (im entpackten Abschnitt) einer vollen Bildzeile,
+    jeweils die frueheste, ab der alle Zeilenanfaenge Tokengrenzen sind;
+    [] wenn nichts sicher ist."""
+    b = bytes(b)
+    n = len(b)
+    i = pos = 0
+    g = [0]
+    while i < n:
+        if b[i] == 0 and i + 3 < n and b[i + 1] == 0 and b[i + 2] == 0xFF:
+            k = b[i + 3]
+            i += 4
+            z = 0
+            while z < rowlen and i < n:
+                i, d = _v1_token(b, i, n)
+                z += d
+            g.extend(pos + z * j for j in range(1, k + 2))
+            pos += z * (k + 1)
+            continue
+        i, d = _v1_token(b, i, n)
+        pos += d
+        if d:
+            g.append(pos)
+    warm = min(pos // 4, 2 * rowlen)       # Anfang noch nicht eingerastet
+    zeilen = (pos - warm) // rowlen
+    if zeilen < mindest:
+        return []
+    gs = set(g)
+    treffer = np.bincount([x % rowlen for x in set(g) if warm <= x < pos],
+                          minlength=rowlen)
+    kand = []
+    for r in np.nonzero(treffer >= 0.95 * zeilen)[0]:
+        x = max(x for x in g if x % rowlen == r and x <= pos)
+        start = x
+        while x - rowlen >= 0 and x - rowlen in gs:
+            x -= rowlen
+            start = x
+        kand.append(int(start))
+    return sorted(kand)
+
+def v1_ebene_waehlen(kand, dec, ref, bpl):
+    """Unter den Startkandidaten den waehlen, dessen erste Zeilen in allen
+    Ebenen am besten zu den Zeilen ref (n, rowlen) darueber passen."""
+    if len(kand) == 1 or ref is None or not len(ref):
+        return kand[0], 0.0
+    line = ref.shape[1]
+    a = plane_profiles(ref.astype(np.uint8), bpl)
+    decb = np.frombuffer(bytes(dec), np.uint8)
+    best = (kand[0], -2.0)
+    for z in kand:
+        nrow = min(3, (len(decb) - z) // line)
+        if nrow < 1:
+            continue
+        b = plane_profiles(decb[z:z + nrow * line].reshape(nrow, line), bpl)
+        cs = []
+        for i in range(len(a)):
+            if a[i].std() < 1e-6 or b[i].std() < 1e-6:
+                cs.append(1.0 if abs(a[i].mean() - b[i].mean()) < 0.3
+                          else 0.0)
+            else:
+                cs.append(float(np.corrcoef(a[i], b[i])[0, 1]))
+        sc = float(np.mean(cs))
+        if sc > best[1]:
+            best = (z, sc)
+    return best
+
+def bild_ebenen(rec):
+    """Zahl der Bitebenen laut VDPC-Kopf (1 = einfarbig, 4 = 16 Farben)."""
+    p = rec[5] if len(rec) > 5 else 4
+    return p if 1 <= p <= 4 else 4
 
 
 def image_decoder(rec):
     """Passenden Entpacker zur Versionskennung des VDPC-Kopfes."""
-    return rle2_decode if rec[4:5] == b"\x01" else rle_decode
+    if rec[4:5] == b"\x01":
+        w = struct.unpack_from("<H", rec, 6)[0]
+        rowlen = bild_ebenen(rec) * ((w + 7) // 8)
+        return lambda b: rle2_decode(b, rowlen)
+    return rle_decode
+
+
+def ebenen_zu_index(a, w):
+    """(Zeilen, Ebenen, bpl) Bytes -> Farbindex je Pixel (Zeilen, w)."""
+    bits = np.unpackbits(a, axis=2)[:, :, :w].astype(np.int16)
+    idx = np.zeros(bits[:, 0].shape, np.int16)
+    for e in range(a.shape[1]):
+        idx |= bits[:, e] << e
+    if a.shape[1] == 1:
+        idx *= 15                       # einfarbig: gesetzt = weiss
+    return idx
 
 
 def best_phase(seg, line):
@@ -400,18 +549,18 @@ def color_hist(buf, line, bpl, w):
     rows = len(buf) // line
     if rows == 0:
         return None
-    a = np.frombuffer(bytes(buf[:rows * line]), np.uint8).reshape(rows, 4, bpl)
-    bits = np.unpackbits(a, axis=2)[:, :, :w].astype(np.int16)
-    idx = bits[:, 0] | bits[:, 1] << 1 | bits[:, 2] << 2 | bits[:, 3] << 3
+    a = np.frombuffer(bytes(buf[:rows * line]), np.uint8)
+    idx = ebenen_zu_index(a.reshape(rows, line // bpl, bpl), w)
     hst = np.bincount(idx.ravel(), minlength=16).astype(float)
     return hst / max(hst.sum(), 1)
 
 
 def plane_profiles(rows, bpl, win=4):
     """rows: (n, 4*bpl) Bytes -> (4, bpl) geglaettete Bitdichte je Ebene."""
-    pc = POPC[rows].reshape(rows.shape[0], 4, bpl).mean(axis=0)
+    npl = rows.shape[1] // bpl
+    pc = POPC[rows].reshape(rows.shape[0], npl, bpl).mean(axis=0)
     k = np.ones(win) / win
-    return np.array([np.convolve(pc[i], k, "same") for i in range(4)])
+    return np.array([np.convolve(pc[i], k, "same") for i in range(npl)])
 
 
 def plane_distance(out, known, dec, p, line, maxgap=80, nref=4):
@@ -541,7 +690,7 @@ def place_segment(out, known, dec, est, pos, line, bpl, w, total,
             seg = decb[off:off + nrow * line].reshape(nrow, line)
             b = plane_profiles(seg, bpl)
             cs = []
-            for i in range(4):
+            for i in range(len(a)):
                 if a[i].std() < 1e-6 or b[i].std() < 1e-6:
                     cs.append(1.0 if abs(a[i].mean() - b[i].mean()) < 0.3
                               else 0.0)
@@ -613,7 +762,8 @@ def decode_image(rec, rec_miss, refs=()):
     Liefert (Breite, Hoehe, Farbindex-Array mit -1 = unbekannt, Info)."""
     w, h = struct.unpack_from("<HH", rec, 6)
     bpl = (w + 7) // 8
-    line = 4 * bpl
+    npl = bild_ebenen(rec)
+    line = npl * bpl
     total = line * h
     comp = rec[10:]
     cm = rec_miss[10:]
@@ -621,21 +771,21 @@ def decode_image(rec, rec_miss, refs=()):
     if not cm.any():
         # vollstaendig empfangen: direkt entpacken, keine Heuristik
         dec = np.frombuffer(bytes(decoder(comp)), np.uint8)
+        if rec[4:5] == b"\x01" and len(dec) > total and \
+                (len(dec) - total) % line == 0:
+            # Manche Bilder enthalten eine Zeile zu viel; sie gehoert an
+            # den oberen Rand (Vergleich mit derselben Grafik in Version 0
+            # aus einer anderen Aufnahme)
+            dec = dec[len(dec) - total:]
         out = np.zeros(total, np.uint8)
         known = np.zeros(total, bool)
         out[:min(total, len(dec))] = dec[:total]
-        if rec[4:5] == b"\x01":
-            known[:] = True        # Rest ist Hintergrund (nicht kodiert)
-        else:
-            known[:len(dec)] = True
-        a = out.reshape(h, 4, bpl)
-        bits = np.unpackbits(a, axis=2)[:, :, :w].astype(np.int16)
-        idx = (bits[:, 0] | bits[:, 1] << 1 | bits[:, 2] << 2 |
-               bits[:, 3] << 3)
-        kn = np.repeat(known.reshape(h, 4, bpl).all(axis=1), 8,
+        known[:len(dec)] = True
+        idx = ebenen_zu_index(out.reshape(h, npl, bpl), w)
+        kn = np.repeat(known.reshape(h, npl, bpl).all(axis=1), 8,
                        axis=1)[:, :w]
         idx[~kn] = -1
-        info = "" if len(dec) >= total or rec[4:5] == b"\x01" else \
+        info = "" if len(dec) >= total else \
             "Bilddaten enden nach Zeile %d" % (len(dec) // line)
         return w, h, idx, info
     # bekannte Abschnitte des komprimierten Stroms
@@ -658,6 +808,46 @@ def decode_image(rec, rec_miss, refs=()):
     ratio = None
     pos = 0
     drift = 0
+    v1 = rec[4:5] == b"\x01"
+    # Version 1 mit bekanntem Anfang und Ende: die Lage der Abschnitte
+    # dazwischen folgt aus dem freien Platz, aufgeteilt im Verhaeltnis der
+    # verlorenen Datenmengen (Zeilenanfaenge sind exakt bekannt)
+    plan, starts = {}, {}
+    if v1 and len(segs) >= 3 and segs[0][0] == 0 and \
+            segs[-1][1] == len(comp):
+        laengen = []
+        d0 = decoder(comp[segs[0][0]:segs[0][1]])
+        nr0 = len(d0) // line
+        ref0 = np.frombuffer(bytes(d0[max(0, nr0 - 3) * line:nr0 * line]),
+                             np.uint8).reshape(-1, line)
+        for k, (s, e) in enumerate(segs):
+            d = decoder(comp[s:e])
+            if k == 0:
+                z = 0
+            else:
+                kand = v1_zeilenanfang(comp[s:e], line, bpl)
+                if not kand:
+                    laengen = None
+                    break
+                if k == len(segs) - 1:
+                    passt = [z for z in kand if (len(d) - z) % line == 0]
+                    z = passt[0] if passt else kand[0]
+                else:
+                    z = v1_ebene_waehlen(kand, d, ref0, bpl)[0]
+            laengen.append(len(d) - z)
+            starts[k] = z
+        if laengen:
+            frei = total - laengen[-1] - sum(laengen[:-1])
+            verl = [segs[k][0] - segs[k - 1][1] for k in range(1, len(segs))]
+            if frei >= 0 and sum(verl):
+                q = laengen[0]
+                acc = 0
+                for k in range(1, len(segs) - 1):
+                    acc += verl[k - 1]
+                    p = laengen[0] + sum(laengen[1:k]) + frei * acc / sum(verl)
+                    p = max(int(round(p / line)) * line, -(-q // line) * line)
+                    plan[k] = p
+                    q = p + laengen[k]
     for k, (s, e) in enumerate(segs):
         dec = decoder(comp[s:e])
         if k == 0 and s == 0:
@@ -665,9 +855,36 @@ def decode_image(rec, rec_miss, refs=()):
         else:
             lost = s - (segs[k - 1][1] if k else 0)
             last = (k == len(segs) - 1 and e == len(comp))
+            z0 = None
+            if k in starts:
+                z0 = starts[k]
+            elif v1:
+                kand = v1_zeilenanfang(comp[s:e], line, bpl)
+                if kand and last:
+                    passt = [z for z in kand if (len(dec) - z) % line == 0]
+                    z0 = passt[0] if passt else None
+                elif kand:
+                    rk = known.reshape(-1, line).all(axis=1)
+                    ob = np.nonzero(rk)[0]
+                    ref = out.reshape(-1, line)[ob[-3:]] if len(ob) else None
+                    z0 = v1_ebene_waehlen(kand, dec, ref, bpl)[0]
+            if z0 is not None:
+                # Bytes vor dem ersten sicheren Zeilenanfang verwerfen
+                # (Decoder noch nicht eingerastet); sie bleiben unbekannt
+                dec = dec[z0:]
             if last and len(dec) <= total:
                 p = total - len(dec)               # Ende passt genau
                 how = "Ende"
+                if z0 is not None:
+                    how += ", Zeilenanfang exakt"
+            elif k in plan and z0 is not None:
+                p = plan[k]
+                how = "Zeilenanfang exakt, Zeile aus den Lueckengroessen"
+            elif z0 is not None and find_in_refs(dec, refs) is None:
+                r_cur = len(dec) / max(e - s, 1) if e - s >= 200 else None
+                est = pos + int(lost * (r_cur or ratio or 2.0))
+                p = max(-(-pos // line), int(round(est / line))) * line
+                how = "Zeilenanfang exakt, Zeile geschaetzt"
             elif find_in_refs(dec, refs) is not None:
                 p = find_in_refs(dec, refs)
                 how = "exakt ueber Wiederholung des Bildes"
@@ -706,10 +923,8 @@ def decode_image(rec, rec_miss, refs=()):
                         "ergaenzt (Uebereinstimmung %.1f %%)" %
                         (100.0 * filled / total, 100 * agree))
             break
-    a = out.astype(np.uint8).reshape(h, 4, bpl)
-    bits = np.unpackbits(a, axis=2)[:, :, :w].astype(np.int16)
-    idx = bits[:, 0] | bits[:, 1] << 1 | bits[:, 2] << 2 | bits[:, 3] << 3
-    kn = known.reshape(h, 4, bpl).all(axis=1)
+    idx = ebenen_zu_index(out.astype(np.uint8).reshape(h, npl, bpl), w)
+    kn = known.reshape(h, npl, bpl).all(axis=1)
     kn = np.repeat(kn, 8, axis=1)[:, :w]
     idx[~kn] = -1
     if drift:
@@ -770,10 +985,18 @@ def texts(rec):
 # Ersatzschriften mit an die Objektgroesse angepasster Groesse) und die
 # Symbole (werden als Platzhalter gezeichnet).
 
-VDI2EGA = [15, 0, 4, 2, 1, 3, 6, 5, 7, 8, 12, 10, 9, 11, 14, 13]
+# Zuordnung Objektfarbe -> EGA-Farbe, Tabelle aus VDGEM.DLL (Offset 0x269E)
+# der Original-Software (weicht bei 7 und 13 von GEM-Standard ab)
+VDI2EGA = [15, 0, 4, 2, 1, 3, 6, 11, 7, 8, 12, 10, 9, 5, 14, 13]
 BAYER4 = np.array([[0, 8, 2, 10], [12, 4, 14, 6],
                    [3, 11, 1, 9], [15, 7, 13, 5]])
 MUSTER = [0, 2, 4, 6, 8, 11, 13, 16]          # Dichte von 16 je Muster 0..7
+# Fuellmuster 1..7 aus VDGEM.DLL (Offset 0x241A, dort in umgekehrter Folge):
+# je 4 Zeilen zu 8 Bildpunkten, gesetztes Bit = Fuellfarbe
+MUSTER_BITS = {7: (0xff, 0xff, 0xff, 0xff), 6: (0xff, 0xdd, 0xff, 0x77),
+               5: (0xff, 0x55, 0xff, 0x55), 4: (0xbb, 0x55, 0xee, 0x55),
+               3: (0xaa, 0x55, 0xaa, 0x55), 2: (0xaa, 0x11, 0xaa, 0x44),
+               1: (0xaa, 0x00, 0xaa, 0x00)}
 GRAU_IDX = 16
 WEISS, SCHWARZ, HELLGRAU = 115, 100, 107     # feste EGA-Farben (+100)
 
@@ -932,14 +1155,17 @@ class Zeichner:
 
     def fill(self, x, y, w, h, col, muster=7, ersetzen=True):
         r = self.clip(x, y, w, h)
-        if not r or muster == 0:
+        if not r or (muster == 0 and not ersetzen):
             return
         x0, y0, x1, y1 = r
-        if muster >= 7:
+        # Muster 0 im Ersetzen-Modus: einfarbig in der Fuellfarbe (so
+        # ergeben z.B. die Handbuchseiten schwarze Schrift auf Hellgrau)
+        if muster >= 7 or muster == 0:
             self.c[y0:y1, x0:x1] = self.farbe(col)
             return
         yy, xx = np.mgrid[y0:y1, x0:x1]
-        an = BAYER4[yy & 3, xx & 3] < MUSTER[muster]
+        rows = np.array(MUSTER_BITS[muster], np.uint8)
+        an = ((rows[yy & 3] >> (7 - (xx & 7))) & 1).astype(bool)
         sub = self.c[y0:y1, x0:x1]
         sub[an] = self.farbe(col)
         if ersetzen:
@@ -997,6 +1223,25 @@ class Zeichner:
         sub = self.c[ty + sy0:ty + sy1, tx + sx0:tx + sx1]
         sub[a[sy0:sy1, sx0:sx1]] = f
 
+    def text_bitmap(self, mask, x, y, w, h, col, just=2, vcenter=True):
+        tw = mask.shape[1]
+        if just == 2:
+            tx = x + (w - tw) // 2
+        elif just == 1:
+            tx = x + w - tw
+        else:
+            tx = x
+        ty = y + (h - mask.shape[0]) // 2 if vcenter else y
+        self.blit_mask(mask, tx, ty, self.farbe(col))
+
+    def textblock_bitmap(self, text, x, y, w, h, col, font):
+        zeilen = wrap_bitmap(text, font, w)
+        for k, z in enumerate(zeilen):
+            if (k + 1) * font.h > h + font.h // 3:
+                break
+            self.text_bitmap(font.render(z), x + 2, y + k * font.h, w, font.h,
+                             col, 0, False)
+
     def textblock(self, text, x, y, w, h, col, art="sans", size=None):
         """Fliesstext mit Umbruch in der Groesse size (sonst passend)."""
         s = size or textblock_size(text, w, h, art)
@@ -1032,6 +1277,141 @@ def textblock_size(text, w, h, art="sans"):
     return 8
 
 
+
+# ---------------------------------------------------------------------------
+# Original-Ressourcen der Empfangssoftware (VD 3.3 DOS / WinVideodat 3.2)
+#
+#   XFONTS/VDxxFNT.XFN  Proportionalschriften. 'VD' 00, uint16 Dateilaenge,
+#                       256 x uint16 Offset je Zeichen (CP437, 0 = fehlt),
+#                       je Zeichen: Breite, Hoehe, Zeilen zu ceil(B/8) Byte.
+#                       Schriftnummer im Seitenobjekt = 0x80 + xx.
+#   GM8X16_n.FNT        Systemschriften 8x16 (Schriftnummer n < 0x80),
+#                       16 Zeilen zu je 256 Byte (Zeile r aller Zeichen).
+#   GMICONS.DAT         767 Symbole 32x32, je Zeile 4 Ebenen zu 4 Byte.
+# ---------------------------------------------------------------------------
+class XfnFont:
+    def __init__(self, path):
+        b = open(path, "rb").read()
+        tab = struct.unpack_from("<256H", b, 5)
+        self.g = {}
+        for c, o in enumerate(tab):
+            if not o or o + 2 > len(b):
+                continue
+            w, h = b[o], b[o + 1]
+            bpr = (w + 7) // 8
+            raw = np.frombuffer(b[o + 2:o + 2 + bpr * h], np.uint8)
+            if w == 0 or len(raw) < bpr * h:
+                continue
+            self.g[c] = np.unpackbits(raw.reshape(h, bpr),
+                                      axis=1)[:, :w].astype(bool)
+        self.h = max((g.shape[0] for g in self.g.values()), default=16)
+        sp = self.g.get(0x20)
+        self.space = sp.shape[1] if sp is not None else self.h // 3
+
+    def glyph(self, c):
+        g = self.g.get(c)
+        if g is None:
+            g = np.zeros((self.h, self.space), bool)
+        return g
+
+    def width(self, bs):
+        return sum(self.glyph(c).shape[1] for c in bs)
+
+    def render(self, bs):
+        if not bs:
+            return np.zeros((self.h, 0), bool)
+        gl = []
+        for c in bs:
+            g = self.glyph(c)
+            if g.shape[0] < self.h:
+                g = np.vstack([g, np.zeros((self.h - g.shape[0], g.shape[1]),
+                                           bool)])
+            gl.append(g[:self.h])
+        return np.concatenate(gl, axis=1)
+
+
+class SysFont(XfnFont):
+    def __init__(self, path, rows):
+        d = np.frombuffer(open(path, "rb").read(), np.uint8)
+        d = d[:rows * 256].reshape(rows, 256)
+        self.g = {c: np.unpackbits(d[:, c][:, None], axis=1).astype(bool)
+                  for c in range(256)}
+        self.h = rows
+        self.space = 8
+
+
+class Original:
+    """Schriften und Symbole aus dem Programmverzeichnis der Software."""
+
+    def __init__(self, root):
+        self.root = root
+        self._fonts = {}
+        self.icons = None
+        p = self._find("GMICONS.DAT")
+        if p:
+            d = np.frombuffer(open(p, "rb").read(), np.uint8)
+            n = len(d) // 512
+            bits = np.unpackbits(d[:n * 512].reshape(n, 32, 4, 4), axis=3)
+            self.icons = (bits[:, :, 0] | bits[:, :, 1] << 1 |
+                          bits[:, :, 2] << 2 | bits[:, :, 3] << 3)
+
+    def _find(self, *parts):
+        for cand in (os.path.join(self.root, *parts),
+                     os.path.join(self.root, *[x.lower() for x in parts])):
+            if os.path.exists(cand):
+                return cand
+        return None
+
+    def font(self, fid):
+        if fid not in self._fonts:
+            f = None
+            try:
+                if fid >= 0x80:
+                    p = self._find("XFONTS", "VD%02XFNT.XFN" % (fid - 0x80))
+                    f = XfnFont(p) if p else None
+                else:
+                    p = (self._find("GM8X16_%d.FNT" % fid) or
+                         self._find("GM8X16_0.FNT"))
+                    f = SysFont(p, 16) if p else None
+            except (OSError, struct.error, ValueError):
+                f = None
+            self._fonts[fid] = f
+        return self._fonts[fid]
+
+    def anzahl(self):
+        xf = self._find("XFONTS")
+        n = len([x for x in os.listdir(xf) if x.upper().endswith(".XFN")]) \
+            if xf else 0
+        return n, (len(self.icons) if self.icons is not None else 0)
+
+    @staticmethod
+    def suchen(kandidaten):
+        for c in kandidaten:
+            if c and (os.path.exists(os.path.join(c, "GMICONS.DAT")) or
+                      os.path.isdir(os.path.join(c, "XFONTS"))):
+                return Original(c)
+        return None
+
+
+def _bytes(s):
+    return s.encode("cp437", "replace")
+
+
+def wrap_bitmap(text, font, w):
+    zeilen = []
+    for a in text.replace("\r\n", "\r").split("\r"):
+        z = b""
+        for wd in _bytes(a).split(b" "):
+            t = (z + b" " + wd) if z else wd
+            if font.width(t) <= w - 4 or not z:
+                z = t
+            else:
+                zeilen.append(z)
+                z = wd
+        zeilen.append(z)
+    return zeilen
+
+
 def font_groessen(seiten, holen=None):
     """Je Schriftnummer eine einheitliche Groesse schaetzen (Median der
     Groessen, mit denen die Texte in ihre Objekte passen). Textfelder
@@ -1061,13 +1441,15 @@ def font_groessen(seiten, holen=None):
                    else np.median(v)) for k, v in werte.items()}
 
 
-def render_seite(seite, holen, groessen, palette="vdi"):
+def render_seite(seite, holen, groessen, palette="vdi", orig=None):
     """Seite zeichnen. holen(nr) liefert (art, inhalt) eines Satzes.
     Rueckgabe: (Farbfeld, Liste der Schaltflaechen, Hinweise)."""
     z = Zeichner(palette=palette)
     knoepfe, hinweise = [], []
     for o, x, y in seite.walk():
-        w, h, ty, sp = o["w"], o["h"], o["typ"], o["spec"]
+        w, h, sp = o["w"], o["h"], o["spec"]
+        ty = o["typ"] & 0xFF            # oberes Byte: Zusatzangabe
+        xt = o["typ"] >> 8
         if o["fehlt"]:
             hinweise.append("Objekte fehlen")
             continue
@@ -1086,24 +1468,32 @@ def render_seite(seite, holen, groessen, palette="vdi"):
             z.rahmen(x, y, w, h, cw >> 12,
                      struct.unpack("b", struct.pack("B", t["dicke"] & 255))[0])
             s = t["text"]
-            if s.strip():
+            f = orig.font(t["font"]) if orig else None
+            if s.strip() and f is not None:
+                z.text_bitmap(f.render(_bytes(s)), x, y, w, h,
+                              (cw >> 8) & 15, t["just"])
+            elif s.strip():
                 art = font_art(t["font"])
                 size = groessen.get(t["font"]) or fit_size(s, art, w, h)
                 size = max(8, min(size, fit_size(s, art, int(w * 1.1), h)))
                 z.text(s, x, y, w, h, (cw >> 8) & 15, art, size, t["just"])
-        elif ty in (0x1A, 0x25):                        # Schaltflaechen
+        elif ty in (0x1A, 0x25, 0x2C):                  # Schaltflaechen
             nr = struct.unpack("<H", sp[:2])[0]
             label = seite.string(seite.ref(sp)) or ""
             dicke = 1 + bool(o["flags"] & 4) + bool(o["flags"] & 2)
             z.fill(x, y, w, h, WEISS)
             z.rahmen(x, y, w, h, SCHWARZ, -dicke)
-            if label:
+            f = orig.font(0) if orig else None
+            if label and f is not None:
+                z.text_bitmap(f.render(_bytes(label)), x, y, w, h, SCHWARZ, 2)
+            elif label:
                 z.text(label, x, y, w, h, SCHWARZ, "mono",
                        fit_size(label, "mono", w - 4, h), 2)
             knoepfe.append(dict(x=x, y=y, w=w, h=h, label=label,
                                 seite=nr if ty == 0x1A else None,
-                                sendung=nr if ty == 0x25 else None))
-        elif ty == 0x21:                                # Bild
+                                sendung=nr if ty == 0x25 else None,
+                                datei=nr if ty == 0x2C else None))
+        elif ty in (0x21, 0x27):                        # Bild
             nr = struct.unpack("<H", sp[:2])[0]
             art, img = holen(nr)
             if art != "bild" or img is None:
@@ -1114,9 +1504,24 @@ def render_seite(seite, holen, groessen, palette="vdi"):
             r = z.clip(x, y, min(w, iw), min(h, ih))
             if r:
                 x0, y0, x1, y1 = r
-                z.c[y0:y1, x0:x1] = np.where(
-                    img[y0 - y:y1 - y, x0 - x:x1 - x] < 0, GRAU_IDX,
-                    img[y0 - y:y1 - y, x0 - x:x1 - x])
+                part = img[y0 - y:y1 - y, x0 - x:x1 - x]
+                neu = np.where(part < 0, GRAU_IDX, part)
+                if ty == 0x27:
+                    # einfarbiges Bild: gesetzte Punkte in der Farbe aus
+                    # dem oberen Typ-Byte, der Rest bleibt durchsichtig
+                    neu = np.where(part > 0, xt & 15,
+                                   np.where(part < 0, GRAU_IDX,
+                                            z.c[y0:y1, x0:x1]))
+                # Typ 0x21 mit oberem Byte (z. B. 0x421, 0xB21): Bedeutung
+                # unbekannt; das Bild wird deckend gezeichnet
+                z.c[y0:y1, x0:x1] = neu
+        elif ty == 0x23 and orig is not None and orig.icons is not None \
+                and struct.unpack("<H", sp[2:4])[0] < len(orig.icons):
+            ic = orig.icons[struct.unpack("<H", sp[2:4])[0]]
+            r = z.clip(x, y, 32, 32)
+            if r:
+                x0, y0, x1, y1 = r
+                z.c[y0:y1, x0:x1] = ic[y0 - y:y1 - y, x0 - x:x1 - x]
         elif ty == 0x23:                                # Symbol
             z.fill(x + 2, y + 2, w - 4, h - 4, HELLGRAU)
             z.rahmen(x + 2, y + 2, w - 4, h - 4, SCHWARZ, 1)
@@ -1127,17 +1532,22 @@ def render_seite(seite, holen, groessen, palette="vdi"):
             p = seite.ref(sp)
             col = 1
             size = None
+            f = None
             if p is not None and p + 20 <= len(seite.rec):
                 col = (struct.unpack(">H", seite.rec[p + 18:p + 20])[0]
                        >> 8) & 15
-                f = struct.unpack(">H", seite.rec[p + 12:p + 14])[0]
-                size = groessen.get(("feld", f))
+                fid = struct.unpack(">H", seite.rec[p + 12:p + 14])[0]
+                size = groessen.get(("feld", fid))
+                f = orig.font(fid) if orig else None
             art, txt = holen(nr)
             if art != "text" or txt is None:
                 z.grau(x, y, w, h)
                 hinweise.append("Text Nr %d fehlt" % nr)
                 continue
             txt = txt.strip("\0 ")
+            if f is not None:
+                z.textblock_bitmap(txt, x, y, w, h, col, f)
+                continue
             if size:
                 size = min(size, textblock_size(txt, w, h))
             z.textblock(txt, x, y, w, h, col, size=size)
@@ -1158,7 +1568,7 @@ def save_canvas(c, path):
 
 
 # ---------------------------------------------------------------------------
-def html_seiten(seiten_info, sendungen_nr, outdir):
+def html_seiten(seiten_info, sendungen_nr, outdir, dateien=None):
     """Kleine HTML-Uebersicht: alle Seiten untereinander, Schaltflaechen
     sind anklickbar (Sprung zur Zielseite, Sendungsdaten als Tooltip)."""
     import html
@@ -1186,11 +1596,24 @@ def html_seiten(seiten_info, sendungen_nr, outdir):
                 teile.append("<area shape='rect' coords='%s' href='#s%d' "
                              "title='%s'>" % (coords, k["seite"],
                                               html.escape(k["label"])))
+            elif k.get("datei") is not None:
+                d = (dateien or {}).get(k["datei"])
+                teile.append("<area shape='rect' coords='%s' title='%s' "
+                             "href='%s'>" % (
+                                 coords, html.escape(
+                                     "%s: Dokument Nr %d" % (k["label"],
+                                                             k["datei"])),
+                                 d or "#s%d" % s["nr"]))
             elif k["sendung"] is not None:
                 e = sendungen_nr.get(k["sendung"])
-                t = ("%s: %s, %s" % (e["kennung"], e["titel"],
-                                     "; ".join(e["zeiten"]))
-                     if e else "Programmeintrag Nr %d" % k["sendung"])
+                if e:
+                    pf, kb = preis_groesse(e["groesse"])
+                    t = "%s: %s, %d kB%s, %s" % (
+                        e["kennung"], e["titel"], kb,
+                        ", DM %d,%02d" % divmod(pf, 100) if pf is not None
+                        else "", "; ".join(e["zeiten"]))
+                else:
+                    t = "Programmeintrag Nr %d" % k["sendung"]
                 teile.append("<area shape='rect' coords='%s' title='%s' "
                              "href='#s%d'>" % (coords, html.escape(t),
                                                s["nr"]))
@@ -1215,9 +1638,17 @@ def main():
     ap.add_argument("--luecken", help="Datei mit fehlenden Bereichen "
                     "(Zeilen 'von-bis'); sonst werden 255-Byte-Nullbloecke "
                     "als fehlend angenommen (nur bei einer VDB-Datei)")
+    ap.add_argument("--nullbloecke", action="store_true",
+                    help="255-Byte-Nullbloecke als fehlend behandeln, auch "
+                    "wenn der Dateiname nicht auf .unvollstaendig endet "
+                    "(bei mehreren Kopien immer)")
     ap.add_argument("--palette", choices=("vdi", "ega"), default="vdi",
                     help="Farbnummern der Seitenobjekte als GEM-VDI-Farben "
                     "(Vorgabe) oder direkt als EGA-Farben deuten")
+    ap.add_argument("--software", metavar="ORDNER",
+                    help="Programmordner der Empfangssoftware (mit XFONTS\\, "
+                    "GMICONS.DAT, GM8X16_*.FNT) fuer Originalschriften und "
+                    "-symbole; sonst wird neben der VDB und dem Skript gesucht")
     ap.add_argument("--ohne-seiten", action="store_true",
                     help="Bildschirmseiten nicht als PNG nachbauen")
     args = ap.parse_args()
@@ -1253,7 +1684,12 @@ def main():
                int(miss.sum()) // BLK, differ))
     else:
         data = datas[0]
-        miss = missing_mask(data, args.luecken)
+        if (args.luecken or args.nullbloecke or
+                "unvollst" in vdbs[0].lower()):
+            miss = missing_mask(data, args.luecken)
+        else:
+            # vollstaendig empfangene Datei: Nullbloecke sind echte Daten
+            miss = np.zeros(len(data), bool)
     recs = find_records(data, miss, idx)
     by_nr = records_by_nr(recs, miss, idx)
     print("%s: %d Bytes, %d fehlende Bloecke (%.0f %%), %d Datensaetze%s" %
@@ -1271,9 +1707,10 @@ def main():
             rec = data[off + 12:off + 12 + r["L"]]
             w, h = struct.unpack_from("<HH", rec, 6)
             dec = bytes(image_decoder(rec)(rec[10:]))
-            if rec[4:5] == b"\x01":
-                dec = dec.ljust(4 * ((w + 7) // 8) * h, b"\0")
-            if len(dec) >= 4 * ((w + 7) // 8) * h:
+            soll = bild_ebenen(rec) * ((w + 7) // 8) * h
+            if rec[4:5] == b"\x01" and len(dec) > soll:
+                dec = dec[len(dec) - soll:]
+            if len(dec) >= soll:
                 refs.setdefault((w, h), []).append(dec)
 
     bilder = {}
@@ -1306,7 +1743,7 @@ def main():
             return k, text_von(off)
         return k, None
 
-    summary, seiten, sendungen = [], [], {}
+    summary, seiten, sendungen, dateien = [], [], {}, {}
     for off, r in sorted(recs.items()):
         if r is None:
             summary.append("%8d  ?        Kopf fehlt (laut IDX vorhanden)"
@@ -1339,6 +1776,19 @@ def main():
             summary.append("%8d  Text     Nr %d, %d Zeichen, %.0f %% fehlen "
                            "-> %s%s: %s" % (off, nr, len(t), fehl, name, alt,
                                             t.replace("\r", " ").strip()[:60]))
+        elif kind == "datei":
+            # Begleitdokument ('DT' + Text mit CR/LF, CP437), z. B. ein
+            # Formular, das die Seite ueber eine Schaltflaeche ausdruckt
+            name = "datei_%03d.txt" % nr
+            t = bytes(rec[2:]).decode("cp437")
+            with open(os.path.join(outdir, name), "w", encoding="utf-8",
+                      newline="") as f:
+                f.write(t.replace("\r\n", "\n").replace("\r", "\n"))
+            dateien[nr] = name
+            erste = next((z for z in t.splitlines() if z.strip()), "")
+            summary.append("%8d  Dokument Nr %d, %d Zeichen, %.0f %% fehlen "
+                           "-> %s%s: %s" % (off, nr, len(t), fehl, name, alt,
+                                            erste.strip()[:60]))
         elif kind == "sendung":
             e = parse_sendung(rec)
             if not rm.any():
@@ -1375,12 +1825,24 @@ def main():
             except struct.error:
                 objs.append(None)
         groessen = font_groessen([s for s in objs if s], holen)
+        here = os.path.dirname(os.path.abspath(vdbs[0]))
+        me = os.path.dirname(os.path.abspath(__file__))
+        orig = Original.suchen([args.software, here, os.path.dirname(here),
+                                os.path.join(here, "VIDEODAT"), me,
+                                os.path.join(me, "VIDEODAT")])
+        if args.software and orig is None:
+            print("Hinweis: im Ordner %s keine Schriften/Symbole gefunden"
+                  % args.software)
+        elif orig:
+            nf, ni = orig.anzahl()
+            print("Originalschriften (%d) und Symbole (%d) aus %s" %
+                  (nf, ni, orig.root))
         info = []
         for (nr, kind, off, rec, rm, t), s in zip(seiten, objs):
             if s is None:
                 continue
             c, knoepfe, hinweise = render_seite(s, holen, groessen,
-                                                args.palette)
+                                                args.palette, orig)
             name = "%s_%03d.png" % (kind, nr)
             save_canvas(c, os.path.join(outdir, name))
             info.append(dict(nr=nr, datei=name, knoepfe=knoepfe,
@@ -1389,7 +1851,7 @@ def main():
                            (kind.capitalize(), nr, name,
                             (" (" + "; ".join(sorted(set(hinweise))) + ")")
                             if hinweise else ""))
-        html_seiten(info, sendungen, outdir)
+        html_seiten(info, sendungen, outdir, dateien)
 
     katalog = {}
     for e in ttl:
@@ -1406,17 +1868,20 @@ def main():
     if katalog:
         with open(os.path.join(outdir, "sendungen.txt"), "w",
                   encoding="utf-8") as f:
-            f.write("Kennung           Groesse  Titel                       "
-                    "       Quelle   Sendetermine\n")
+            f.write("Kennung            Preis   Groesse  Titel                "
+                    "              Quelle   Sendetermine\n")
             for kenn in sorted(katalog):
                 e = katalog[kenn]
-                f.write("%-17s %7d  %-34s %-8s %s\n" % (
-                    kenn, e["groesse"], e["titel"], e["quelle"],
+                pf, kb = preis_groesse(e["groesse"])
+                f.write("%-17s %9s %6d kB  %-34s %-8s %s\n" % (
+                    kenn, "DM %d,%02d" % divmod(pf, 100) if pf is not None
+                    else "", kb, e["titel"], e["quelle"],
                     ", ".join(e["zeiten"])))
             kat = next((e["katalog"] for e in ttl if "katalog" in e), None)
             if kat:
                 f.write("\nKatalog erstellt: %s\n" % kat)
-            f.write("Groesse vermutlich in KByte.\n")
+            f.write("Preis = Kaufpreis per KontoDisk; Groesse in kB "
+                    "(1000 Bytes, aufgerundet).\n")
     with open(os.path.join(outdir, "inhalt.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(summary) + "\n")
     print("\n".join(summary))
