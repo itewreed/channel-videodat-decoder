@@ -535,14 +535,37 @@ class Pkt:
     __slots__ = ("pos", "A", "B", "C", "raw", "pay", "ok", "soft", "how")
 
 
+def _unstuff_packet(stream, start):
+    """Read one frame, removing FF escaped after an embedded 56 AE marker.
+
+    Keep byte indexes so VBI soft-bit evidence still addresses the right bits.
+    Callers accept this interpretation only if the complete checksum passes.
+    """
+    raw = bytearray(stream[start:start + 2])
+    indexes = [start, start + 1]
+    pos, length = start + 2, None
+    while pos < len(stream) and (length is None or len(raw) < length):
+        raw.append(stream[pos])
+        indexes.append(pos)
+        pos += 1
+        if len(raw) == 4:
+            length = (1 << (raw[3] & 15)) + 11
+        if len(raw) > 3 and raw[-2:] == SYNC and pos < len(stream) and stream[pos] == 255:
+            pos += 1
+    return bytes(raw), indexes, pos
+
+
 def find_packets(stream):
     """stream: Stream (mit Bit-Sicherheiten) oder bytes"""
     soft = None
     if isinstance(stream, Stream):
         soft, stream = stream.soft, stream.data
     pk = []
+    valid_end = 0
     for m in re.finditer(SYNC, stream):
         p = m.start()
+        if p < valid_end:
+            continue
         if p + 9 > len(stream):
             break
         B = stream[p + 3]
@@ -556,6 +579,19 @@ def find_packets(stream):
         x.pay, x.ok = descramble(x.raw)
         x.soft = soft[8 * p:8 * (p + L)] if soft is not None else None
         x.how = "ok" if x.ok else ""
+        if not x.ok:
+            raw, indexes, end = _unstuff_packet(stream, p)
+            if end - p > len(raw):
+                pay, ok = descramble(raw)
+                if ok:
+                    x.raw, x.pay, x.ok, x.how = raw, pay, True, "unstuffed"
+                    x.A, x.B, x.C = raw[2:5]
+                    if soft is not None:
+                        bit_indexes = (np.array(indexes)[:, None] * 8 + np.arange(8)).ravel()
+                        x.soft = soft[bit_indexes]
+                    valid_end = end
+        elif x.ok:
+            valid_end = p + L
         pk.append(x)
     return pk
 
@@ -915,7 +951,7 @@ def rescue_headers(bad, okx, oku, seq, blksz_hint, log, A):
     return rescued
 
 
-def assemble(pk, outdir, keep_partial, dump_other, log):
+def assemble(pk, outdir, keep_partial, dump_other, log, file_manifest=None):
     os.makedirs(outdir, exist_ok=True)
     subs = collections.defaultdict(list)
     badsubs = collections.defaultdict(list)
@@ -933,11 +969,13 @@ def assemble(pk, outdir, keep_partial, dump_other, log):
         xs = [x for x, u in keep]
         us = [u for x, u in keep]
         seq = {}
+        positions = collections.defaultdict(list)
         votes = collections.defaultdict(collections.Counter)
         for x, u in keep:
+            positions[u].append(x.pos)
             seq.setdefault(u, x.pay)
             # unreparierte Pakete zaehlen doppelt
-            votes[u][x.pay] += 2 if getattr(x, "how", "ok") == "ok" else 1
+            votes[u][x.pay] += 2 if getattr(x, "how", "ok") in ("ok", "unstuffed") else 1
         bl = collections.Counter(len(p) - 1 for p in seq.values() if p[0] == 4)
         # Blockgroesse = groesster Datenblock im Strom (normal 255). Der letzte
         # Block einer Datei wird oft in einem kleineren Paket gesendet und darf
@@ -965,7 +1003,8 @@ def assemble(pk, outdir, keep_partial, dump_other, log):
             key = (cur["name"], cur["size"], cur["mtime"])
             f = files.get(key)
             if f is None:
-                f = files[key] = dict(cur, blocks={}, count=0, A=A)
+                f = files[key] = dict(cur, blocks={}, count=0, A=A, header_positions=[])
+            f["header_positions"].extend(cur["header_positions"])
             if not f["blocks"] and cur["blocks"]:
                 f["blksz"], f["nblk"] = cur["blksz"], cur["nblk"]
             if cur["blocks"] and f["blksz"] != cur["blksz"]:
@@ -988,6 +1027,7 @@ def assemble(pk, outdir, keep_partial, dump_other, log):
                         "%d ignoriert" % (A, size))
                     continue
                 cur = dict(name=safe_name(p[14:14 + nl]), size=size,
+                           header_positions=positions.get(u, []),
                            mtime=dos_time(struct.unpack_from("<I", p, 9)[0]),
                            start=u, blocks={}, blksz=blksz_hint,
                            nblk=-(-size // blksz_hint) if blksz_hint else 0)
@@ -1068,6 +1108,7 @@ def assemble(pk, outdir, keep_partial, dump_other, log):
     for (name, size, mtime), f in files.items():
         data = bytearray()
         missing = 0
+        missing_ranges, conflicting_ranges = [], []
         for i in range(f["nblk"]):
             cnt = f["blocks"].get(i)
             blk = None
@@ -1075,9 +1116,13 @@ def assemble(pk, outdir, keep_partial, dump_other, log):
                 blk = cnt.most_common(1)[0][0]
                 if len(cnt) > 1:
                     conflicts += 1
+                    conflicting_ranges.append([i * f["blksz"], min(size, (i + 1) * f["blksz"])])
             if blk is None:
                 missing += 1
                 blk = bytes(f["blksz"])
+                missing_ranges.append([i * f["blksz"], min(size, (i + 1) * f["blksz"])])
+            elif len(blk) < min(f["blksz"], size - i * f["blksz"]):
+                missing_ranges.append([i * f["blksz"] + len(blk), min(size, (i + 1) * f["blksz"])])
             data += blk[:f["blksz"]].ljust(f["blksz"], b"\0")
         data = data[:size]
         complete = missing == 0 and len(data) == size
@@ -1103,6 +1148,11 @@ def assemble(pk, outdir, keep_partial, dump_other, log):
                     pass
         results.append((f["A"], name, size, missing, f["nblk"], path,
                         f["count"]))
+        if file_manifest is not None:
+            file_manifest.append(dict(stream=f["A"], name=name, size=size, path=path,
+                                      header_positions=f["header_positions"],
+                                      missing_ranges=missing_ranges,
+                                      conflicting_ranges=conflicting_ranges))
     if n_rescued:
         log("  %d defekte Dateikoepfe repariert" % n_rescued)
     if conflicts:
@@ -1116,13 +1166,12 @@ def assemble(pk, outdir, keep_partial, dump_other, log):
 #
 # Durch Analyse einer Aufnahme vom 11.04.1993 rekonstruiert:
 #   Strom 01 Typ 06  Uhrzeit: 06 JJ MM TT hh mm ss 00, alle 5 Sekunden
-#   Strom 01 Typ 05  127 Byte Nutzdaten, jedes 2. Byte nur 7 Bit, sonst
-#                    zufaellig verteilt -> verschluesselt (15-Bit-Werte),
-#                    pausiert, wenn Unterkanal 1 eine Sendung uebertraegt
-#   Strom 03 Typ 07  verschluesselt in 8-Byte-Bloecken (gleiche Klartext-
-#                    bloecke ergeben gleiche Geheimtextbloecke, ECB-artig);
-#                    ca. 30 verschiedene Pakete im Umlauf
-#   Strom 03 Typ 0A  16 Byte, stets gleich, alle ~2,5 Minuten
+#   Strom 01 Typ 05  Im Sample exakt 64 LE16-PRNG-Werte (15 Bit), Byte 0
+#                    mit Typ 05 ueberschrieben; siehe videodat_prng.py.
+#                    Andere Aufnahmen werden auf exakte Uebereinstimmung geprueft.
+#   Strom 03 Typ 07/08  Kontoguthaben, VideoDat-DES mit 8 Runden
+#   Strom 03 Typ 0A  Dispo-Aenderung, 16 Byte, VideoDat-DES mit 8 Runden
+#                    (aus WINVD.EXE rekonstruiert; DESCRAMBLER_NOTES.md)
 #   Strom 00 Typ 00  Bitlisten in 32-Byte-Bloecken:
 #                    00 [Liste] [Block LE16] 00 [Anzahl LE16] Daten
 #                    Daten komprimiert: 00 n = n Nullbytes, FF n = n FF-
@@ -1334,13 +1383,13 @@ def analyse_dienste(pk, outdir, log):
     gruppen = collections.defaultdict(list)
     for x in ok:
         p = x.pay
-        if (x.A, p[0]) in ((0x01, 0x05), (0x03, 0x07), (0x03, 0x0A)):
+        if (x.A, p[0]) in ((0x01, 0x05), (0x03, 0x07), (0x03, 0x08), (0x03, 0x0A)):
             gruppen[(x.A, p[0])].append(x)
-    texte = {(0x01, 0x05): "verschluesselt; jedes 2. Byte 7 Bit (15-Bit-"
+    texte = {(0x01, 0x05): "unbekannt; jedes 2. Byte 7 Bit (15-Bit-"
              "Werte), keine Wiederholungen",
-             (0x03, 0x07): "verschluesselt in 8-Byte-Bloecken (ECB-artig), "
-             "Pakete werden zyklisch wiederholt",
-             (0x03, 0x0A): "kurzes Steuerpaket, stets gleich"}
+             (0x03, 0x07): "Kontoguthaben; VideoDat-DES, 8 Runden",
+             (0x03, 0x08): "Kontoguthaben; VideoDat-DES, 8 Runden",
+             (0x03, 0x0A): "Dispo-Aenderung; VideoDat-DES, 8 Runden"}
     for (A, t), xs in sorted(gruppen.items()):
         verschieden = collections.OrderedDict()
         for x in xs:
@@ -1349,6 +1398,24 @@ def analyse_dienste(pk, outdir, log):
         with open(os.path.join(outdir, name), "wb") as f:
             for pay in verschieden:
                 f.write(struct.pack("<H", len(pay)) + pay)
+        if (A, t) == (0x01, 0x05):
+            import json
+            from videodat_prng import analyse_type05
+            matched = 0
+            classifications = collections.Counter()
+            report_name = "dienst_01_typ05_analysis.jsonl"
+            with open(os.path.join(outdir, report_name), "w", encoding="utf-8") as f:
+                for pay, positions in verschieden.items():
+                    try:
+                        record = analyse_type05(pay)
+                    except ValueError as error:
+                        record = dict(kind="unknown", matches_prng=False, error=str(error))
+                    matched += int(record["matches_prng"])
+                    classifications[record["kind"]] += 1
+                    record.update(positions=positions, copies=len(positions))
+                    f.write(json.dumps(record) + "\n")
+            texte[(A, t)] = "%d/%d exakt passende PRNG-Folgen; %s -> %s" % (
+                matched, len(verschieden), dict(classifications), report_name)
         w("  Strom %02X Typ %02X: %d Pakete, %d verschieden, %s - %s; %s"
           " -> %s" % (A, t, len(xs), len(verschieden), hm(uhr(xs[0].pos)),
                       hm(uhr(xs[-1].pos)), texte[(A, t)], name))
@@ -1399,6 +1466,12 @@ def main():
                     "verschluesselte Daten) nicht auswerten")
     ap.add_argument("--dump-other", action="store_true",
                     help="Pakete anderer Dienste roh ablegen")
+    ap.add_argument("--decrypt-services", action="store_true",
+                    help="Strom 03 Typ 07/08/0A entschluesseln und mit innerer "
+                    "Pruefsumme als JSONL protokollieren")
+    ap.add_argument("--decrypt-files", action="store_true",
+                    help="CHVDFILE-Dateien mit Schluesseln aus langen Typ-01-"
+                    "Endpaketen entschluesseln; Luecken bleiben markiert")
     args = ap.parse_args()
     log = print
 
@@ -1421,11 +1494,20 @@ def main():
 
     pk = find_packets(stream)
     n_ok = sum(x.ok for x in pk)
+    n_unstuffed = sum(x.how == "unstuffed" for x in pk)
     fixed = repair(pk)
     log("Pakete: %d gefunden, %d Pruefsumme ok, repariert: %d per "
         "Soft-Decision, %d aus Kopien" %
         (len(pk), n_ok, fixed["soft"], fixed["kopien"]))
-    res = assemble(pk, args.outdir, args.partial, args.dump_other, log)
+    if n_unstuffed:
+        log("  %d Pakete nach Entfernen von Sync-Escape-Bytes gueltig" % n_unstuffed)
+    file_manifest = [] if args.decrypt_files else None
+    res = assemble(pk, args.outdir, args.partial, args.dump_other, log, file_manifest)
+    if args.decrypt_files:
+        from videodat_files import write_file_report
+        file_counts = write_file_report(pk, file_manifest,
+                                       os.path.join(args.outdir, "decrypted_files"))
+        log("Datei-Entschluesselung: %s" % file_counts)
     log("")
     log("Dateien:")
     for A, name, size, missing, nblk, path, count in res:
@@ -1447,6 +1529,15 @@ def main():
     log("%d Dateien, davon %d vollstaendig" % (len(res), n_ok))
     if not args.keine_dienste:
         analyse_dienste(pk, os.path.join(args.outdir, "dienste"), log)
+    if args.decrypt_services:
+        from videodat_crypto import write_service_report
+        service_dir = os.path.join(args.outdir, "dienste")
+        os.makedirs(service_dir, exist_ok=True)
+        report = os.path.join(service_dir, "decrypted_services.jsonl")
+        counts = write_service_report(pk, report)
+        log("Entschluesselung: %d innere Pruefsummen ok, %d falsch, "
+            "%d ungueltige Pakete -> %s" %
+            (counts["passed"], counts["failed"], counts["malformed"], report))
 
 
 if __name__ == "__main__":
