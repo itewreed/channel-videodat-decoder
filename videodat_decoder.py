@@ -137,13 +137,14 @@ def framing(l, ph, fmt):
     return max(a, 20 - a)
 
 
-def slice_line(l, fmt=FMT_BTTV, prior=None):
+def slice_line(l, fmt=FMT_BTTV, prior=None, ph=None):
     """Eine VBI-Zeile -> (10 Bytes, 80 Bit-Sicherheiten) oder None.
 
-    prior: siehe line_phase.
+    prior: siehe line_phase; ph: bereits bestimmte Phase (aus line_phase).
     Sicherheit = (Abtastwert - Schwelle) / Hub, >0 bedeutet 'hell'."""
     l = np.asarray(l, dtype=float)
-    ph = line_phase(l, fmt, prior)
+    if ph is None:
+        ph = line_phase(l, fmt, prior)
     if ph is None:
         return None
     e0, thr, lo, hi = ph
@@ -176,30 +177,149 @@ class Stream:
         return self
 
 
-def read_vbi(path, line_len, lines_per_frame, lines, log):
+def vbi_framing(l):
+    """(Phase, Rahmung 0..20) einer bttv-Zeile; Rahmung -1 ohne Daten."""
+    l = np.asarray(l, dtype=float)
+    ph = line_phase(l, FMT_BTTV)
+    return ph, (-1 if ph is None else framing(l, ph, FMT_BTTV))
+
+
+def detect_vbi_lines(L, nfr, lpf, max_frames, log, block=25, need=50,
+                     stable_blocks=5):
+    """VideoDat-Zeilen je Halbbild im bttv-Puffer finden.
+
+    Bei bt848-Aufnahmen springt die Lage der Datenzeilen am Aufnahmeanfang
+    oft von Bild zu Bild um einige Zeilen (instabile V-Synchronisation),
+    oder es steht noch ein falscher Bildinhalt im Puffer. Gezaehlt wird daher
+    je Halbbild die zusammenhaengende Gruppe einwandfrei gerahmter Zeilen
+    (siehe framing); Anzahl und Lage der Zeilen sind die haeufigsten Werte.
+    Gesucht wird blockweise (1 s), bis sich das Ergebnis stable_blocks Bloecke
+    lang nicht mehr aendert und genug Stimmen vorliegen, hoechstens
+    max_frames Bilder.
+    Rueckgabe: Liste der Zeilenindizes je Halbbild."""
+    half = lpf // 2
+    runs = [collections.Counter(), collections.Counter()]
+
+    def result():
+        out, votes = [], []
+        for c in runs:
+            if not c:
+                out.append([])
+                votes.append(0)
+                continue
+            k = collections.Counter()
+            for (_, n), v in c.items():
+                k[n] += v
+            k = k.most_common(1)[0][0]
+            (s0, _), v = max(((r, v) for r, v in c.items() if r[1] == k),
+                             key=lambda x: x[1])
+            out.append(list(range(s0, s0 + k)))
+            votes.append(v)
+        return out, votes
+
+    last, stable, end, fi = None, 0, min(nfr, max_frames), 0
+    for b0 in range(0, end, block):
+        for fi in range(b0, min(b0 + block, end)):
+            for h in (0, 1):
+                ok = [li for li in range(h * half, (h + 1) * half)
+                      if vbi_framing(L[fi * lpf + li])[1] >= 18]
+                if ok and ok[-1] - ok[0] + 1 == len(ok):
+                    runs[h][(ok[0], len(ok))] += 1
+        sets, votes = result()
+        if min(votes) >= need and sets == last:
+            stable += 1
+        else:
+            stable = 0
+        last = sets
+        if stable >= stable_blocks:
+            break
+    t = min(fi + 1, end)
+    if last is None:
+        last, votes = [[], []], [0, 0]
+    log("Zeilensuche ueber %d Bilder (%.1f s), Stimmen je Halbbild: %s" %
+        (t, t / 25.0, ", ".join("%d" % v for v in votes)))
+    for h in (0, 1):
+        if not last[h]:
+            log("WARNUNG: im %d. Halbbild keine VideoDat-Zeile gefunden "
+                "(ggf. --lines angeben oder --scan-seconds erhoehen)" % (h + 1))
+    return last
+
+
+def track_vbi_lines(L, base, nominal, half_rng):
+    """Zeilen eines Halbbilds, die dekodiert werden sollen.
+
+    Sind alle erwarteten Zeilen einwandfrei gerahmt, bleibt es bei ihnen.
+    Sonst wird die Zeilengruppe innerhalb des Halbbilds verschoben, bis
+    moeglichst viele ihrer Zeilen gerahmt sind (bei Gleichstand die kleinste
+    Verschiebung). Bei einer Verschiebung werden nur gerahmte Zeilen
+    verwendet, damit kein Bildinhalt in den Datenstrom geraet; findet sich
+    nirgends eine gerahmte Zeile, bleibt es bei den erwarteten Zeilen.
+    Rueckgabe: (Liste (Zeilenindex, Phase), Verschiebung)."""
+    q = {}
+
+    def get(li):
+        if li not in q:
+            q[li] = vbi_framing(L[base + li])
+        return q[li]
+
+    if all(get(li)[1] >= 18 for li in nominal):
+        return [(li, q[li][0]) for li in nominal], 0
+    lo, hi = half_rng
+
+    def framed(d):          # gerahmte Zeilen der Gruppe innerhalb des Halbbilds
+        return [li + d for li in nominal
+                if lo <= li + d < hi and get(li + d)[1] >= 18]
+
+    best = (0, 0)
+    for d in sorted(range(lo - nominal[-1], hi - nominal[0]), key=abs):
+        c = len(framed(d))
+        if c > best[0]:
+            best = (c, d)
+    d = best[1]
+    if d == 0:
+        return [(li, get(li)[0]) for li in nominal], 0
+    return [(li, q[li][0]) for li in framed(d)], d
+
+
+def read_vbi(path, line_len, lines_per_frame, lines, log,
+             scan_seconds=30.0, track=True):
     raw = np.memmap(path, dtype=np.uint8, mode="r")
     n = len(raw) // line_len
     L = raw[:n * line_len].reshape(n, line_len)
+    nfr = n // lines_per_frame
+    half = lines_per_frame // 2
     if lines is None:                          # Zeilen automatisch finden
-        cnt = collections.Counter()
-        frames = min(n // lines_per_frame, 400)
-        for i in range(frames * lines_per_frame):
-            r = slice_line(L[i], FMT_BTTV)
-            if r is not None and SYNC in r[0]:
-                cnt[i % lines_per_frame] += 1
-        best = max(cnt.values()) if cnt else 0
-        lines = sorted(k for k, v in cnt.items() if v >= best * 0.2)
-        log("VideoDat-Zeilen (automatisch): %s" % lines)
-    sel = set(lines)
+        sets = detect_vbi_lines(L, nfr, lines_per_frame,
+                                int(scan_seconds * 25), log)
+        log("VideoDat-Zeilen (automatisch): %s" % (sets[0] + sets[1]))
+    else:
+        sets = [sorted(li for li in lines if li // half == h)
+                for h in (0, 1)]
+        rest = sorted(li for li in lines if li >= 2 * half)
+        if rest:
+            log("WARNUNG: Zeilen ausserhalb des Puffers ignoriert: %s" % rest)
     st = Stream()
-    for i in range(n):
-        if i % lines_per_frame not in sel:
-            continue
-        r = slice_line(L[i], FMT_BTTV)
-        if r is not None:          # leere Zeile: nichts gesendet
-            st.add(r)
+    shifted = 0
+    for fi in range(nfr):
+        base = fi * lines_per_frame
+        for h, nominal in enumerate(sets):
+            if not nominal:
+                continue
+            if track:
+                sel, d = track_vbi_lines(L, base, nominal,
+                                         (h * half, (h + 1) * half))
+                shifted += d != 0
+            else:
+                sel = [(li, None) for li in nominal]
+            for li, ph in sel:
+                r = slice_line(L[base + li], FMT_BTTV, ph=ph)
+                if r is not None:          # leere Zeile: nichts gesendet
+                    st.add(r)
     log("%d Bilder, %d Datenzeilen -> %d Bytes" %
-        (n // lines_per_frame, len(st.soft), len(st.data)))
+        (nfr, len(st.soft), len(st.data)))
+    if shifted:
+        log("  in %d Halbbildern lagen die VideoDat-Zeilen verschoben" %
+            shifted)
     return st.finish()
 
 
@@ -1444,8 +1564,11 @@ def main():
                     help="TBC: H-Sync nicht als Zeitbezug verwenden")
     ap.add_argument("--no-eq", action="store_true",
                     help="TBC: keinen Entzerrer lernen (nur adaptive Schwelle)")
+    ap.add_argument("--no-line-tracking", action="store_true",
+                    help="VBI: Zeilen nicht je Halbbild nachfuehren, sondern "
+                    "immer die erkannten bzw. angegebenen Zeilen dekodieren")
     ap.add_argument("--scan-seconds", type=float, default=30.0,
-                    help="TBC: Zeilensuche hoechstens ueber so viele Sekunden "
+                    help="Zeilensuche hoechstens ueber so viele Sekunden "
                     "vom Aufnahmeanfang (bricht frueher ab, sobald die "
                     "Zeilen sicher erkannt sind)")
     ap.add_argument("-o", "--outdir", default="videodat1993_out")
@@ -1487,7 +1610,8 @@ def main():
                           not args.no_eq)
     else:
         stream = read_vbi(args.input, args.line_length, args.lines_per_frame,
-                          lines, log)
+                          lines, log, args.scan_seconds,
+                          not args.no_line_tracking)
     if args.save_bytes:
         open(args.save_bytes, "wb").write(
             stream.data if isinstance(stream, Stream) else stream)
