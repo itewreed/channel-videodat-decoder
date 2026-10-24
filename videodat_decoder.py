@@ -443,7 +443,8 @@ def detect_tbc_lines(F, order, nf, max_fields, log, maxline=40,
     """VideoDat-Zeilen je Halbbild-Paritaet finden.
 
     Kriterium ist die Byte-Rahmung (1993: Start-/Stopbit in allen 10 Bytes,
-    hoechstens 2 Fehler; 1990: alle 4 Bytes fehlerfrei), nicht das Sync-Wort: 56 AE liegt nur selten
+    hoechstens 2 Fehler; 1990: alle 4 Bytes fehlerfrei), nicht das
+    Sync-Wort: 56 AE liegt nur selten
     vollstaendig in einer Zeile, und in gestoerten Aufnahmen reichten die
     wenigen Treffer am Anfang nicht aus. Gesucht wird blockweise (1 s),
     bis beide Paritaeten genug Treffer haben und sich die Auswahl
