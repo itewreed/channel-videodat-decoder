@@ -69,8 +69,8 @@ python3 videodat_decoder.py INPUT [options]
 
 | Option | Default | Meaning |
 |---|---|---|
-| `INPUT` | – | Raw VBI capture (bttv), TBC file (extension `.tbc`) or, with `--bytes`, an already decoded byte stream |
-| `--format {auto,vbi,tbc}` | `auto` | Input format. `auto` picks `tbc` for the `.tbc` extension, otherwise `vbi` |
+| `INPUT` | – | Raw VBI capture (bttv), TBC file (extension `.tbc`, or `.tbcy` for the luma file of newer vhs-decode versions) or, with `--bytes`, an already decoded byte stream |
+| `--format {auto,vbi,tbc}` | `auto` | Input format. `auto` picks `tbc` for the extensions `.tbc`, `.tbcy` and `.tbcc` (the latter is the chroma file without VBI data, a warning is printed), otherwise `vbi`. If no data lines are found in a VBI capture, the decoder stops with a hint instead of decoding the whole file |
 | `--variant {auto,1993,1990}` | `auto` | Transmission variant. `auto` compares how many lines of a sample (start of the recording, up to `--scan-seconds`) are correctly framed with each variant. With `--bytes`, `auto` means `1993`; pass `--variant 1990` for a 1990 channel stream |
 | `--bytes` | off | Input is a byte stream, e.g. written by `--save-bytes`. Skips signal processing |
 | `--lines LIST` | automatic | Lines carrying VideoDat. VBI: line index in the capture buffer (0–31, 0–15 = first field), e.g. `4,5,6,20,21,22`. TBC: PAL frame lines, e.g. `11,12,13,324,325,326` |

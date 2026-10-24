@@ -313,6 +313,8 @@ def detect_vbi_lines(L, nfr, lpf, max_frames, log, block=25, need=50,
         last, votes = [[], []], [0, 0]
     log("Zeilensuche ueber %d Bilder (%.1f s), Stimmen je Halbbild: %s" %
         (t, t / 25.0, ", ".join("%d" % v for v in votes)))
+    # einzelne Zufallstreffer (z.B. Bildinhalt) sind keine Datenzeilen
+    last = [s if v >= 10 else [] for s, v in zip(last, votes)]
     for h in (0, 1):
         if not last[h]:
             log("WARNUNG: im %d. Halbbild keine VideoDat-Zeile gefunden "
@@ -372,6 +374,10 @@ def read_vbi(path, line_len, lines_per_frame, lines, log,
         sets = detect_vbi_lines(L, nfr, lines_per_frame,
                                 int(scan_seconds * 25), log, fmt=fmt)
         log("VideoDat-Zeilen (automatisch): %s" % (sets[0] + sets[1]))
+        if not sets[0] and not sets[1]:
+            raise SystemExit("Keine VideoDat-Zeilen gefunden. Ist die Datei "
+                             "wirklich eine bttv-VBI-Aufnahme? TBC-Dateien "
+                             "ggf. mit --format tbc angeben.")
     else:
         sets = [sorted(li for li in lines if li // half == h)
                 for h in (0, 1)]
@@ -1703,7 +1709,12 @@ def main():
 
     fmt = args.format
     if fmt == "auto":
-        fmt = "tbc" if args.input.lower().endswith(".tbc") else "vbi"
+        # vhs-decode schreibt Luma als .tbc oder .tbcy, Chroma als .tbcc
+        ext = os.path.splitext(args.input)[1].lower()
+        fmt = "tbc" if ext in (".tbc", ".tbcy", ".tbcc") else "vbi"
+        if ext == ".tbcc":
+            log("WARNUNG: .tbcc ist die Chroma-Datei; VideoDat steht in der "
+                "Luma-Datei (.tbc bzw. .tbcy)")
     lines = [int(v) for v in args.lines.split(",")] if args.lines else None
     cap = None
     if args.bytes:
