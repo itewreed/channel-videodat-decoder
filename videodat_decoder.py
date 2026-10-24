@@ -23,6 +23,9 @@ kann einen Fehler nicht orten).
 Bitebene (identisch mit MD-SE.exe, siehe videodat_decode.py):
   NRZ 2 Mbit/s, pro VBI-Zeile 10 Bytes, je Byte Startbit + 8 Datenbits
   (LSB zuerst) + Stopbit, Byte invertiert.
+  Die fruehe Variante von 1990 (800 kbit/s, 4 Bytes pro Zeile, eigenes
+  Paketformat) ist in videodat1990.py beschrieben; die Variante wird am
+  Signal erkannt (--variant).
 
 Paketformat 1993 (durch Analyse der Aufnahme rekonstruiert):
 
@@ -75,13 +78,32 @@ MAX_FILE = 64 * 1024 * 1024     # groessere Dateikoepfe gelten als Fehler
 # Bit-Slicer
 # ---------------------------------------------------------------------------
 class Fmt:
-    """Abtastparameter einer Quelle."""
-    def __init__(self, fs, lo_rng, search, min_swing):
-        self.spb = fs / 2.0e6          # Samples pro Bit
+    """Abtastparameter einer Quelle und einer Uebertragungsvariante."""
+    def __init__(self, fs, lo_rng, search, min_swing, variant="1993"):
+        v = VARIANTS[variant]
+        self.fs = fs
+        self.variant = variant
+        self.spb = fs / v["bitrate"]   # Samples pro Bit
+        self.nbytes = v["nbytes"]      # Bytes pro Zeile
+        self.nbits = 10 * self.nbytes  # inkl. Start- und Stopbits
+        # Mindestzahl korrekter Start-/Stopbits fuer eine Datenzeile
+        self.frame_min = v["frame_min"]
         self.lo_rng = lo_rng           # Bereich fuer Austastpegel
         self.search = search           # Suchbereich Startflanke
         self.min_swing = min_swing     # Mindesthub Daten
 
+    def with_variant(self, variant):
+        return Fmt(self.fs, self.lo_rng, self.search, self.min_swing, variant)
+
+
+# Uebertragungsvarianten (Bitebene):
+#   1993: 2 Mbit/s, 10 Bytes pro Zeile, Pakete mit Sync 56 AE (siehe oben)
+#   1990: 800 kbit/s, 4 Bytes pro Zeile, SOH-Pakete (siehe videodat1990.py)
+# Bei nur 8 Rahmungsbits (1990) muss die Rahmung fehlerfrei sein.
+VARIANTS = {
+    "1993": dict(bitrate=2.0e6, nbytes=10, frame_min=18),
+    "1990": dict(bitrate=0.8e6, nbytes=4, frame_min=8),
+}
 
 FMT_BTTV = Fmt(35.46895e6, (16, 100), (100, 0x180), 30)
 FMT_TBC_PAL = Fmt(17.734475e6, (100, 190), (150, 400), 3000)
@@ -94,10 +116,11 @@ def line_phase(l, fmt=FMT_BTTV, prior=None):
     ohne prior wird die erste steigende Flanke gesucht."""
     l = np.asarray(l, dtype=float)
     spb = fmt.spb
+    nb = fmt.nbits
     n = len(l)
     s0 = fmt.search[0]
     lo = np.median(l[fmt.lo_rng[0]:fmt.lo_rng[1]])
-    hi = np.percentile(l[s0:min(n, s0 + int(105 * spb))], 90)
+    hi = np.percentile(l[s0:min(n, s0 + int((nb + 5) * spb))], 90)
     if hi - lo < fmt.min_swing:
         return None
     thr = (lo + hi) / 2
@@ -114,31 +137,36 @@ def line_phase(l, fmt=FMT_BTTV, prior=None):
     # Phase ueber alle Flanken der Zeile verfeinern
     s = l >= thr
     a = max(int(e0) - 3, 0)
-    E = min(a + int(101 * spb), n - 2)
+    E = min(a + int((nb + 1) * spb), n - 2)
     idx = np.nonzero(s[a:E] != s[a + 1:E + 1])[0] + a
     if len(idx) > 4:
         fr = idx + (thr - l[idx]) / (l[idx + 1] - l[idx])
         ph = np.angle(np.mean(np.exp(2j * np.pi * (fr - e0) / spb)))
         e0 += ph * spb / (2 * np.pi)
-    if not np.isfinite(e0) or e0 < 0 or e0 + 100 * spb >= n - 1:
+    if not np.isfinite(e0) or e0 < 0 or e0 + nb * spb >= n - 1:
         return None
     return e0, thr, lo, hi
 
 
 def framing(l, ph, fmt):
-    """Anzahl korrekter Start-/Stopbits (0..20) einer Zeile mit Phase ph
-    (aus line_phase). Start- und Stopbit haben in jedem Byte entgegen-
-    gesetzten Pegel; zufaellige Signale erreichen selten mehr als 15."""
+    """Anzahl korrekter Start-/Stopbits (0..2*Bytes, 1993: 0..20) einer
+    Zeile mit Phase ph (aus line_phase). Start- und Stopbit haben in jedem
+    Byte entgegengesetzten Pegel; zufaellige Signale erreichen 1993 selten
+    mehr als 15."""
     e0, thr = ph[0], ph[1]
-    k = np.arange(10) * 10
+    k = np.arange(fmt.nbytes) * 10
     st = l[(e0 + (k + 0.5) * fmt.spb).astype(int)] >= thr
     sp = l[(e0 + (k + 9.5) * fmt.spb).astype(int)] >= thr
     a = int(st.sum()) + int((~sp).sum())
-    return max(a, 20 - a)
+    return max(a, 2 * fmt.nbytes - a)
+
+
+def framing_full(fmt):
+    return 2 * fmt.nbytes
 
 
 def slice_line(l, fmt=FMT_BTTV, prior=None, ph=None):
-    """Eine VBI-Zeile -> (10 Bytes, 80 Bit-Sicherheiten) oder None.
+    """Eine VBI-Zeile -> (Bytes, 8 Bit-Sicherheiten je Byte) oder None.
 
     prior: siehe line_phase; ph: bereits bestimmte Phase (aus line_phase).
     Sicherheit = (Abtastwert - Schwelle) / Hub, >0 bedeutet 'hell'."""
@@ -149,15 +177,41 @@ def slice_line(l, fmt=FMT_BTTV, prior=None, ph=None):
         return None
     e0, thr, lo, hi = ph
     spb = fmt.spb
-    x = e0 +(np.arange(10)[:, None] * 10 + 1.5 + np.arange(8)[None, :]) * spb
+    x = e0 + (np.arange(fmt.nbytes)[:, None] * 10 + 1.5 +
+              np.arange(8)[None, :]) * spb
     ia = x.astype(int)
     f = x - ia
     v = l[ia] * (1 - f) + l[ia + 1] * f
-    soft = ((v - thr) / (hi - lo)).astype(np.float32)     # 10 x 8
+    soft = ((v - thr) / (hi - lo)).astype(np.float32)     # Bytes x 8
     bits = soft >= 0
     out = bytes(int(np.dot(bits[k], 1 << np.arange(8))) ^ 0xFF
-                for k in range(10))
+                for k in range(fmt.nbytes))
     return out, soft.reshape(-1)
+
+
+class Capture:
+    """Gelesene Datenzeilen in Empfangsreihenfolge: (Halbbild bzw. Bild,
+    Platz, (Bytes, Sicherheiten)). Platz = Rang der Zeile unter den
+    Datenzeilen ihres Halbbilds (0 = oberste); 1990 traegt jeder Platz
+    bzw. jede Gruppe von Plaetzen einen eigenen Kanal."""
+    def __init__(self, fmt):
+        self.fmt = fmt
+        self.items = []
+        self.slot_names = {}       # Platz -> Zeilen, z.B. "11-324"
+
+    def add(self, fi, slot, r):
+        self.items.append((fi, slot, r))
+
+    def slots(self):
+        return sorted({s for _, s, _ in self.items})
+
+    def stream(self, slots=None):
+        """Byte-Strom aller (bzw. der angegebenen) Plaetze."""
+        st = Stream()
+        for _, s, r in self.items:
+            if slots is None or s in slots:
+                st.add(r)
+        return st.finish()
 
 
 class Stream:
@@ -177,15 +231,35 @@ class Stream:
         return self
 
 
-def vbi_framing(l):
-    """(Phase, Rahmung 0..20) einer bttv-Zeile; Rahmung -1 ohne Daten."""
+def vbi_framing(l, fmt=FMT_BTTV):
+    """(Phase, Rahmung) einer bttv-Zeile; Rahmung -1 ohne Daten."""
     l = np.asarray(l, dtype=float)
-    ph = line_phase(l, FMT_BTTV)
-    return ph, (-1 if ph is None else framing(l, ph, FMT_BTTV))
+    ph = line_phase(l, fmt)
+    return ph, (-1 if ph is None else framing(l, ph, fmt))
+
+
+def choose_variant(lines, fmt, log, variant="auto"):
+    """Uebertragungsvariante aus einer Stichprobe von Zeilen bestimmen:
+    die Variante, bei der die meisten Zeilen einwandfrei gerahmt sind.
+    Rueckgabe: Fmt der gewaehlten Variante."""
+    if variant != "auto":
+        return fmt.with_variant(variant)
+    hits = collections.Counter()
+    fmts = {v: fmt.with_variant(v) for v in VARIANTS}
+    for l in lines:
+        l = np.asarray(l, dtype=float)
+        for v, f in fmts.items():
+            ph = line_phase(l, f)
+            if ph is not None and framing(l, ph, f) >= f.frame_min:
+                hits[v] += 1
+    best = max(VARIANTS, key=lambda v: (hits[v], v))
+    log("Variante %s (gerahmte Zeilen in der Stichprobe: %s)" %
+        (best, ", ".join("%s: %d" % (v, hits[v]) for v in sorted(VARIANTS))))
+    return fmts[best]
 
 
 def detect_vbi_lines(L, nfr, lpf, max_frames, log, block=25, need=50,
-                     stable_blocks=5):
+                     stable_blocks=5, fmt=FMT_BTTV):
     """VideoDat-Zeilen je Halbbild im bttv-Puffer finden.
 
     Bei bt848-Aufnahmen springt die Lage der Datenzeilen am Aufnahmeanfang
@@ -222,7 +296,8 @@ def detect_vbi_lines(L, nfr, lpf, max_frames, log, block=25, need=50,
         for fi in range(b0, min(b0 + block, end)):
             for h in (0, 1):
                 ok = [li for li in range(h * half, (h + 1) * half)
-                      if vbi_framing(L[fi * lpf + li])[1] >= 18]
+                      if vbi_framing(L[fi * lpf + li], fmt)[1] >=
+                      fmt.frame_min]
                 if ok and ok[-1] - ok[0] + 1 == len(ok):
                     runs[h][(ok[0], len(ok))] += 1
         sets, votes = result()
@@ -245,7 +320,7 @@ def detect_vbi_lines(L, nfr, lpf, max_frames, log, block=25, need=50,
     return last
 
 
-def track_vbi_lines(L, base, nominal, half_rng):
+def track_vbi_lines(L, base, nominal, half_rng, fmt=FMT_BTTV):
     """Zeilen eines Halbbilds, die dekodiert werden sollen.
 
     Sind alle erwarteten Zeilen einwandfrei gerahmt, bleibt es bei ihnen.
@@ -259,16 +334,16 @@ def track_vbi_lines(L, base, nominal, half_rng):
 
     def get(li):
         if li not in q:
-            q[li] = vbi_framing(L[base + li])
+            q[li] = vbi_framing(L[base + li], fmt)
         return q[li]
 
-    if all(get(li)[1] >= 18 for li in nominal):
+    if all(get(li)[1] >= fmt.frame_min for li in nominal):
         return [(li, q[li][0]) for li in nominal], 0
     lo, hi = half_rng
 
     def framed(d):          # gerahmte Zeilen der Gruppe innerhalb des Halbbilds
         return [li + d for li in nominal
-                if lo <= li + d < hi and get(li + d)[1] >= 18]
+                if lo <= li + d < hi and get(li + d)[1] >= fmt.frame_min]
 
     best = (0, 0)
     for d in sorted(range(lo - nominal[-1], hi - nominal[0]), key=abs):
@@ -282,15 +357,20 @@ def track_vbi_lines(L, base, nominal, half_rng):
 
 
 def read_vbi(path, line_len, lines_per_frame, lines, log,
-             scan_seconds=30.0, track=True):
+             scan_seconds=30.0, track=True, variant="auto"):
     raw = np.memmap(path, dtype=np.uint8, mode="r")
     n = len(raw) // line_len
     L = raw[:n * line_len].reshape(n, line_len)
     nfr = n // lines_per_frame
     half = lines_per_frame // 2
+    # Stichprobe fuer die Variantenwahl: alle Zeilen jedes 5. Bilds
+    probe = (L[fi * lines_per_frame + li]
+             for fi in range(0, min(nfr, int(scan_seconds * 25)), 5)
+             for li in range(lines_per_frame))
+    fmt = choose_variant(probe, FMT_BTTV, log, variant)
     if lines is None:                          # Zeilen automatisch finden
         sets = detect_vbi_lines(L, nfr, lines_per_frame,
-                                int(scan_seconds * 25), log)
+                                int(scan_seconds * 25), log, fmt=fmt)
         log("VideoDat-Zeilen (automatisch): %s" % (sets[0] + sets[1]))
     else:
         sets = [sorted(li for li in lines if li // half == h)
@@ -298,7 +378,9 @@ def read_vbi(path, line_len, lines_per_frame, lines, log,
         rest = sorted(li for li in lines if li >= 2 * half)
         if rest:
             log("WARNUNG: Zeilen ausserhalb des Puffers ignoriert: %s" % rest)
-    st = Stream()
+    cap = Capture(fmt)
+    for i in range(max(len(sets[0]), len(sets[1]))):
+        cap.slot_names[i] = "-".join(str(z[i]) for z in sets if i < len(z))
     shifted = 0
     for fi in range(nfr):
         base = fi * lines_per_frame
@@ -307,20 +389,20 @@ def read_vbi(path, line_len, lines_per_frame, lines, log,
                 continue
             if track:
                 sel, d = track_vbi_lines(L, base, nominal,
-                                         (h * half, (h + 1) * half))
+                                         (h * half, (h + 1) * half), fmt)
                 shifted += d != 0
             else:
-                sel = [(li, None) for li in nominal]
+                sel, d = [(li, None) for li in nominal], 0
             for li, ph in sel:
-                r = slice_line(L[base + li], FMT_BTTV, ph=ph)
+                r = slice_line(L[base + li], fmt, ph=ph)
                 if r is not None:          # leere Zeile: nichts gesendet
-                    st.add(r)
+                    cap.add(fi, nominal.index(li - d), r)
     log("%d Bilder, %d Datenzeilen -> %d Bytes" %
-        (nfr, len(st.soft), len(st.data)))
+        (nfr, len(cap.items), len(cap.items) * fmt.nbytes))
     if shifted:
         log("  in %d Halbbildern lagen die VideoDat-Zeilen verschoben" %
             shifted)
-    return st.finish()
+    return cap
 
 
 # ---------------------------------------------------------------------------
@@ -357,11 +439,11 @@ def tbc_field_order(path, nf):
 
 
 def detect_tbc_lines(F, order, nf, max_fields, log, maxline=40,
-                     block=50, need=100, stable_blocks=5):
+                     block=50, need=100, stable_blocks=5, fmt=FMT_TBC_PAL):
     """VideoDat-Zeilen je Halbbild-Paritaet finden.
 
-    Kriterium ist die Byte-Rahmung (Start-/Stopbit in allen 10 Bytes,
-    hoechstens 2 Fehler), nicht das Sync-Wort: 56 AE liegt nur selten
+    Kriterium ist die Byte-Rahmung (1993: Start-/Stopbit in allen 10 Bytes,
+    hoechstens 2 Fehler; 1990: alle 4 Bytes fehlerfrei), nicht das Sync-Wort: 56 AE liegt nur selten
     vollstaendig in einer Zeile, und in gestoerten Aufnahmen reichten die
     wenigen Treffer am Anfang nicht aus. Gesucht wird blockweise (1 s),
     bis beide Paritaeten genug Treffer haben und sich die Auswahl
@@ -385,13 +467,13 @@ def detect_tbc_lines(F, order, nf, max_fields, log, maxline=40,
             rows = np.asarray(F[fi, :maxline], dtype=float)
             for li in range(min(maxline, len(rows))):
                 l = rows[li]
-                ph = line_phase(l, FMT_TBC_PAL)
+                ph = line_phase(l, fmt)
                 if ph is None:
                     continue
-                q = framing(l, ph, FMT_TBC_PAL)
-                if q >= 18:
+                q = framing(l, ph, fmt)
+                if q >= fmt.frame_min:
                     score[par][li] += 1
-                if q == 20:
+                if q == framing_full(fmt):
                     s = hsync_end(l)
                     if s is not None:
                         offs.append((par, li, ph[0] - s))
@@ -432,10 +514,11 @@ EQ_TAPS = np.arange(-4, 5) * 0.5          # Abtastpunkte relativ zur Bitmitte
 
 
 def tbc_features(l, ph, fmt=FMT_TBC_PAL):
-    """Abtastwerte um jede der 100 Bitmitten (Start-/Daten-/Stopbits),
-    normiert mit der 2-Means-Schwelle -> Matrix (100, len(EQ_TAPS)+1)."""
+    """Abtastwerte um jede der Bitmitten (Start-/Daten-/Stopbits, 1993: 100),
+    normiert mit der 2-Means-Schwelle -> Matrix (Bits, len(EQ_TAPS)+1)."""
     e0, thr, lo, hi = ph
-    x = e0 + (np.arange(100)[:, None] + 0.5 + EQ_TAPS[None, :]) * fmt.spb
+    nb = fmt.nbits
+    x = e0 + (np.arange(nb)[:, None] + 0.5 + EQ_TAPS[None, :]) * fmt.spb
     x = np.clip(x, 0, len(l) - 2)
     ia = x.astype(int)
     f = x - ia
@@ -447,7 +530,7 @@ def tbc_features(l, ph, fmt=FMT_TBC_PAL):
         if not len(a) or not len(b):
             break
         t = (a.mean() + b.mean()) / 2
-    return np.hstack([(s - t) / (hi - lo), np.ones((100, 1))])
+    return np.hstack([(s - t) / (hi - lo), np.ones((nb, 1))])
 
 
 class Equalizer:
@@ -459,20 +542,21 @@ class Equalizer:
 
 
 def soft100_to_line(y):
-    """100 Sicherheiten (inkl. Start-/Stopbits) -> (10 Bytes, 80 Sicherh.)"""
-    soft = np.asarray(y, np.float32).reshape(10, 10)[:, 1:9]
+    """Sicherheiten aller Bits einer Zeile (inkl. Start-/Stopbits, 1993: 100)
+    -> (Bytes, 8 Sicherheiten je Byte)"""
+    soft = np.asarray(y, np.float32).reshape(-1, 10)[:, 1:9]
     out = (np.packbits(soft >= 0, axis=1, bitorder="little")[:, 0] ^ 0xFF)
     return out.tobytes(), soft.reshape(-1)
 
 
-def slice_tbc(l, prior=None, eq=None):
-    """TBC-Zeile -> (10 Bytes, 80 Bit-Sicherheiten) oder None.
+def slice_tbc(l, prior=None, eq=None, fmt=FMT_TBC_PAL):
+    """TBC-Zeile -> (Bytes, 8 Bit-Sicherheiten je Byte) oder None.
     Ohne Entzerrer: 2-Means-Schwelle in der Bitmitte."""
     l = np.asarray(l, dtype=float)
-    ph = line_phase(l, FMT_TBC_PAL, prior)
+    ph = line_phase(l, fmt, prior)
     if ph is None:
         return None
-    X = tbc_features(l, ph)
+    X = tbc_features(l, ph, fmt)
     y = eq.soft100(X) if eq is not None else X[:, len(EQ_TAPS) // 2]
     return soft100_to_line(y)
 
@@ -544,7 +628,7 @@ def train_equalizer(F, order, sets, offset, start, nf, log,
 
 
 def read_tbc(path, width, field_lines, lines, use_sync, log,
-             scan_seconds=30.0, use_eq=True):
+             scan_seconds=30.0, use_eq=True, variant="auto"):
     raw = np.memmap(path, dtype="<u2", mode="r")
     fsz = width * field_lines
     nf = len(raw) // fsz
@@ -559,11 +643,17 @@ def read_tbc(path, width, field_lines, lines, use_sync, log,
         f2 = {n - 314 for n in fl if 314 <= n <= 625}
         return f1, f2
 
-    # 1) Zeilen bestimmen (Halbbild-Zeilenindex)
+    # 0) Variante bestimmen (Stichprobe: Zeilen 1..40 jedes 10. Halbbilds)
     max_fields = int(scan_seconds * 50)
+    maxline = min(40, field_lines)
+    probe = (F[fi, li] for fi in range(0, min(nf, max_fields), 10)
+             for li in range(maxline))
+    fmt = choose_variant(probe, FMT_TBC_PAL, log, variant)
+
+    # 1) Zeilen bestimmen (Halbbild-Zeilenindex)
     if lines is None:
         sets, offs = detect_tbc_lines(F, order, nf, max_fields, log,
-                                      maxline=min(40, field_lines))
+                                      maxline=maxline, fmt=fmt)
         log("VideoDat-Zeilen (automatisch, Bildzeilen PAL): %s" %
             (sorted(k + 1 for k in sets[0]) + sorted(k + 314 for k in sets[1])))
     else:
@@ -580,10 +670,10 @@ def read_tbc(path, width, field_lines, lines, use_sync, log,
             for fi in range(min(nf, max_fields)):
                 for li in sorted(sets[0 if order[fi] else 1]):
                     l = np.asarray(F[fi, li], dtype=float)
-                    ph = line_phase(l, FMT_TBC_PAL)
+                    ph = line_phase(l, fmt)
                     s = hsync_end(l)
                     if ph is not None and s is not None and \
-                            framing(l, ph, FMT_TBC_PAL) == 20:
+                            framing(l, ph, fmt) == framing_full(fmt):
                         offs.append(ph[0] - s)
                 if len(offs) >= 500:
                     break
@@ -593,18 +683,25 @@ def read_tbc(path, width, field_lines, lines, use_sync, log,
                 "(Streuung %.2f)" % (offset, float(np.std(offs))))
 
     # 3) Entzerrer lernen (ab Ende der Zeilensuche, dort ist das Signal
-    # i.d.R. stabil)
+    # i.d.R. stabil). Nur 1993: Das 800-kbit/s-Signal von 1990 ist auch
+    # in VHS-Aufnahmen sauber genug fuer die einfache Schwelle.
     eq = None
-    if use_eq:
+    if use_eq and fmt.variant == "1990":
+        log("Entzerrer: fuer Variante 1990 nicht verwendet")
+    elif use_eq:
         eq = train_equalizer(F, order, sets, offset,
                              min(max_fields, nf // 2) if lines is None else 0,
                              nf, log)
 
     # 4) dekodieren
-    st = Stream()
+    cap = Capture(fmt)
+    l1, l2 = sorted(k + 1 for k in sets[0]), sorted(k + 314 for k in sets[1])
+    for i in range(max(len(l1), len(l2))):
+        cap.slot_names[i] = "-".join(str(z[i]) for z in (l1, l2)
+                                     if i < len(z))
     nsync = 0
     for fi in range(nf):
-        for li in sorted(sets[0 if order[fi] else 1]):
+        for slot, li in enumerate(sorted(sets[0 if order[fi] else 1])):
             l = np.asarray(F[fi, li], dtype=float)
             prior = None
             if offset is not None:
@@ -612,12 +709,12 @@ def read_tbc(path, width, field_lines, lines, use_sync, log,
                 if s is not None:
                     prior = s + offset
                     nsync += 1
-            r = slice_tbc(l, prior, eq)
+            r = slice_tbc(l, prior, eq, fmt)
             if r is not None:
-                st.add(r)
+                cap.add(fi, slot, r)
     log("%d Halbbilder, %d Datenzeilen (%d mit H-Sync-Bezug) -> %d Bytes" %
-        (nf, len(st.soft), nsync, len(st.data)))
-    return st.finish()
+        (nf, len(cap.items), nsync, len(cap.items) * fmt.nbytes))
+    return cap
 
 
 # ---------------------------------------------------------------------------
@@ -1550,12 +1647,17 @@ def analyse_dienste(pk, outdir, log):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Pro7-VideoDat (1993) aus VBI")
+    ap = argparse.ArgumentParser(description="Pro7-VideoDat (1990/1993) "
+                                 "aus VBI")
     ap.add_argument("input", help="VBI-Rohdatei (bttv), TBC-Datei "
                     "(vhs-decode, Endung .tbc) oder mit --bytes "
                     "ein bereits dekodierter Byte-Strom")
     ap.add_argument("--format", choices=["auto", "vbi", "tbc"],
                     default="auto", help="Eingabeformat (auto: nach Endung)")
+    ap.add_argument("--variant", choices=["auto", "1993", "1990"],
+                    default="auto", help="Uebertragungsvariante: 1993 = "
+                    "2 Mbit/s, 10 Bytes je Zeile; 1990 = 800 kbit/s, 4 Bytes "
+                    "je Zeile (auto: aus dem Signal; mit --bytes gilt 1993)")
     ap.add_argument("--tbc-width", type=int, default=1135,
                     help="TBC: Samples pro Zeile (PAL 1135)")
     ap.add_argument("--tbc-field-lines", type=int, default=313,
@@ -1573,7 +1675,7 @@ def main():
                     "Zeilen sicher erkannt sind)")
     ap.add_argument("-o", "--outdir", default="videodat1993_out")
     ap.add_argument("--bytes", action="store_true",
-                    help="Eingabe ist ein Byte-Strom (10 Byte je Zeile)")
+                    help="Eingabe ist ein Byte-Strom (z.B. aus --save-bytes)")
     ap.add_argument("--save-bytes", metavar="DATEI",
                     help="dekodierten Byte-Strom speichern")
     ap.add_argument("--line-length", type=int, default=2048)
@@ -1602,16 +1704,50 @@ def main():
     if fmt == "auto":
         fmt = "tbc" if args.input.lower().endswith(".tbc") else "vbi"
     lines = [int(v) for v in args.lines.split(",")] if args.lines else None
+    cap = None
     if args.bytes:
         stream = open(args.input, "rb").read()
-    elif fmt == "tbc":
-        stream = read_tbc(args.input, args.tbc_width, args.tbc_field_lines,
-                          lines, not args.no_sync, log, args.scan_seconds,
-                          not args.no_eq)
+        variant = "1990" if args.variant == "1990" else "1993"
     else:
-        stream = read_vbi(args.input, args.line_length, args.lines_per_frame,
-                          lines, log, args.scan_seconds,
-                          not args.no_line_tracking)
+        if fmt == "tbc":
+            cap = read_tbc(args.input, args.tbc_width, args.tbc_field_lines,
+                           lines, not args.no_sync, log, args.scan_seconds,
+                           not args.no_eq, args.variant)
+        else:
+            cap = read_vbi(args.input, args.line_length,
+                           args.lines_per_frame, lines, log,
+                           args.scan_seconds, not args.no_line_tracking,
+                           args.variant)
+        variant = cap.fmt.variant
+
+    if variant == "1990":
+        import videodat1990
+        if cap is not None:
+            channels = videodat1990.split_channels(cap, log)
+        else:
+            channels = [("bytes", stream)]
+        if args.save_bytes and cap is not None:
+            stem, ext = os.path.splitext(args.save_bytes)
+            for label, st in channels:
+                fn = "%s_%s%s" % (stem, label, ext)
+                open(fn, "wb").write(st.data)
+                log("Byte-Strom %s -> %s" % (label, fn))
+        res = videodat1990.run(channels, args, log)
+        log("")
+        log("Dateien:")
+        for A, name, size, missing, nblk, path, count in res:
+            st = "vollstaendig" if missing == 0 else \
+                "unvollstaendig (%d von %d Bloecken fehlen)" % (missing, nblk)
+            rep = "  (%dx gesendet)" % count if count > 1 else ""
+            log("  Kanal %02X  %-14s %8d Bytes  %s%s%s" %
+                (A, name, size, st, rep, "" if path else
+                 "  [nicht geschrieben]"))
+        log("%d Dateien, davon %d vollstaendig" %
+            (len(res), sum(1 for r in res if r[3] == 0)))
+        return
+
+    if cap is not None:
+        stream = cap.stream()
     if args.save_bytes:
         open(args.save_bytes, "wb").write(
             stream.data if isinstance(stream, Stream) else stream)
