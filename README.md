@@ -283,7 +283,10 @@ python3 decrypt_services.py out/dienste/dienst_03_typ07.bin -o services.jsonl
 
 Checks the packets of stream 01 type 05 (`dienst_01_typ05.bin`) for an exact
 match with the known 15-bit pseudo-random sequence and reports deviations.
-Exact matches are consistent with filler or test data.
+Exact matches are consistent with filler or test data. Payloads of 16, 32,
+64, 128 and 256 bytes are checked (observed: 16 and 128 bytes in 1993, 64
+bytes in early 1991); near matches with up to four changed bytes are
+reported for payloads of 64 bytes or more.
 
 ```sh
 python3 analyse_type05.py out/dienste/dienst_01_typ05.bin -o type05.json --details type05.jsonl

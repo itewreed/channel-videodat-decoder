@@ -12,6 +12,12 @@ from functools import lru_cache
 MULTIPLIER = 0x015A4E35
 MASK = 0x7FFFFFFF
 INVERSE = pow(MULTIPLIER, -1, 1 << 31)
+# Type 05 payloads are 2**n bytes. Observed: 16 and 128 (1993 sample),
+# 64 (tape158, early 1991).
+LENGTHS = (16, 32, 64, 128, 256)
+# Near matches are only searched in payloads long enough that four changed
+# bytes still leave a unique generator state.
+NEAR_MIN_LENGTH = 64
 
 
 @lru_cache(maxsize=1)
@@ -40,8 +46,9 @@ def generate_type05(first_state, length=128):
     """
     if not isinstance(first_state, int) or not 0 <= first_state <= MASK:
         raise ValueError("first_state must be an integer in [0, 2**31)")
-    if length not in (16, 128):
-        raise ValueError("supported type 05 lengths are 16 and 128 bytes")
+    if length not in LENGTHS:
+        raise ValueError("supported type 05 lengths are %s bytes" %
+                         ", ".join(map(str, LENGTHS)))
     state = first_state
     output = bytearray()
     for _ in range(length // 2):
@@ -59,8 +66,9 @@ def identify_type05(payload):
     Returns diagnostics only; no speculative plaintext is produced.
     """
     payload = bytes(payload)
-    if len(payload) not in (16, 128) or payload[0] != 5:
-        raise ValueError("expected a 16- or 128-byte type 05 payload")
+    if len(payload) not in LENGTHS or payload[0] != 5:
+        raise ValueError("expected a type 05 payload of %s bytes" %
+                         ", ".join(map(str, LENGTHS)))
     words = struct.unpack("<%dH" % (len(payload) // 2 - 1), payload[2:])
     result = dict(kind="unknown", matches_prng=False, length=len(payload))
     if payload[1] & 0x80 or any(word & 0x8000 for word in words):
@@ -98,7 +106,7 @@ def analyse_type05(payload):
 
     Diagnostics never rewrite the input or call an altered packet an exact
     match. Near matches require a unique generator state within four changed
-    bytes of a 128-byte payload. The purpose of the broadcast data remains an
+    bytes of a payload of at least NEAR_MIN_LENGTH bytes. The purpose of the broadcast data remains an
     inference, independently of whether its bytes match this generator.
     """
     payload = bytes(payload)
@@ -119,9 +127,9 @@ def analyse_type05(payload):
                       candidate_first_state_mod_2_31=found["first_state_mod_2_31"],
                       sum_preserved=True)
         return result
-    if len(payload) != 128:
+    if len(payload) < NEAR_MIN_LENGTH:
         return result
-    words = struct.unpack("<63H", payload[2:])
+    words = struct.unpack("<%dH" % (len(payload) // 2 - 1), payload[2:])
     seeds = set()
     for i, (first, second) in enumerate(zip(words, words[1:])):
         if first > 32767 or second > 32767:
@@ -133,7 +141,7 @@ def analyse_type05(payload):
             seeds.add(state)
     candidates = []
     for seed in seeds:
-        predicted = generate_type05(seed)
+        predicted = generate_type05(seed, len(payload))
         differences = [dict(offset=i, observed=a, predicted=b)
                        for i, (a, b) in enumerate(zip(payload, predicted)) if a != b]
         if 1 <= len(differences) <= 4:
