@@ -1696,9 +1696,11 @@ def analyse_dienste(pk, outdir, log):
             kopf = unwrap_transmission(p)
             if kopf["checksum_ok"]:
                 name = bytes(p[16:16 + p[15]]).decode("cp437", "replace").strip()
-                ereig.append((x.pos, "Strom %02X Bezahlsendung '%s', Preisfeld "
-                              "%d, Sendezeit %s" % (x.A, name, kopf["price_raw"],
-                                                    hm(_dos_dt(p[1:5])))))
+                # Preis in Pfennig, wie im Katalog (SHARESHP.VDB)
+                ereig.append((x.pos, "Strom %02X Bezahlsendung '%s', DM %d,%02d, "
+                              "Sendezeit %s" % ((x.A, name) +
+                                                divmod(kopf["price_raw"], 100) +
+                                                (hm(_dos_dt(p[1:5])),))))
         elif x.B & 0x80 and p[0] == 0x01 and len(p) == 8:
             ereig.append((x.pos, "Strom %02X Sendungsende, Zeit %s" %
                           (x.A, hm(_dos_dt(p[1:5])))))

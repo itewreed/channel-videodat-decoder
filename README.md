@@ -193,7 +193,7 @@ length is only known from the packet header.
 | 01/06 | Clock |
 | 03/07, 03/08, 03/0A | Encrypted services, see [`decrypt_services.py`](#decrypt_servicespy) |
 | \*/00, \*/01 | Transmission header and end, subchannel 1. The header holds the send time, the number of files and the name, the rest of the packet is often an uninitialised buffer of the sending computer (e.g. `c:\SENDUNG\DOS-SHAR\...`) |
-| \*/09 | Header of a paid transmission with an encrypted price field |
+| \*/09 | Header of a paid transmission with an encrypted price in Pfennig (300 = DM 3,00). All 8 paid transmissions of a December 1993 recording match the prices in the `SHARESHP.VDB` catalogue |
 | \*/FF | 8 bytes from the same generator as 01/05, sent at a fixed place in each transmission |
 
 The packet checksum is a plain sum, so a bit error in the permutation bytes
