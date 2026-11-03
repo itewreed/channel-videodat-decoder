@@ -56,6 +56,11 @@ Nutzlast, Byte 0 = Typ:
   sonstige: andere Dienste, siehe analyse_dienste() (Uhrzeit, Sendungs-
   ablauf, Bitlisten, verschluesselte Dienste)
 Jedes Paket wird i.d.R. zweimal gesendet (Gruppen zu 4 Paketen).
+
+Die Pruefsumme deckt D, E, F und S nicht direkt ab, und die Permutation
+aendert die Summe nicht: Ein Bitfehler in D, E oder F ergibt ein "gueltiges"
+Paket mit falsch sortierter Nutzlast, oft mit falschem Typ-Byte. Das korrigiert
+korrigiere_permutation() aus den Kopien oder am Paketinhalt.
 """
 
 import argparse
@@ -72,6 +77,10 @@ FS = 35.46895e6
 SPB = FS / 2.0e6
 SYNC = b"\x56\xae"
 MAX_FILE = 64 * 1024 * 1024     # groessere Dateikoepfe gelten als Fehler
+# Laengere Nutzlasten als 2^8 Bytes kamen in keinem Muster vor. Die Koepfe
+# solcher Pakete sind Stoerungen; ihre lange Summe "passt" beim Zusammensetzen
+# aus Kopien leicht zufaellig.
+MAX_PAY_BITS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -735,14 +744,8 @@ def qperm(D, E, F):
     return [(((c ^ e) + (d ^ e) + 1) * m) % 8 for c in range(8)]
 
 
-def descramble(raw):
-    """raw = komplettes Paket inkl. Sync und Summe -> (Nutzlast, ok)"""
-    A, B, C, D, E, F, S = raw[2:9]
-    n = 1 << (B & 15)
-    if len(raw) < n + 11:
-        return b"", False
-    k = S ^ 0x58
-    q = qperm(D, E, F)
+def _entwuerfeln(raw, q, n):
+    k = raw[8] ^ 0x58
     pay = bytearray(n)
     for i in range(n):
         g, c = divmod(i, 8)
@@ -750,6 +753,16 @@ def descramble(raw):
         pay[i] = raw[pos] ^ k if pos < 9 + n else 0
     if n < 8:                       # sehr kurze Pakete: keine Permutation
         pay = bytearray(b ^ k for b in raw[9:9 + n])
+    return pay
+
+
+def descramble(raw):
+    """raw = komplettes Paket inkl. Sync und Summe -> (Nutzlast, ok)"""
+    A, B, C, D, E, F, S = raw[2:9]
+    n = 1 << (B & 15)
+    if len(raw) < n + 11:
+        return b"", False
+    pay = _entwuerfeln(raw, qperm(D, E, F), n)
     ck = raw[9 + n] | raw[10 + n] << 8
     ok = ((A + B + C + sum(pay)) & 0xFFFF) == ck
     return bytes(pay), ok
@@ -793,6 +806,8 @@ def find_packets(stream):
         if p + 9 > len(stream):
             break
         B = stream[p + 3]
+        if B & 15 > MAX_PAY_BITS:
+            continue
         L = (1 << (B & 15)) + 11
         if p + L > len(stream):
             continue
@@ -991,6 +1006,104 @@ def repair(pk, max_diff=14):
                 x.raw, x.pay, x.ok, x.how = good, pay, True, how
             fixed[how] += 1
     return fixed
+
+
+# ---------------------------------------------------------------------------
+# Permutationsfehler
+# ---------------------------------------------------------------------------
+def _typ_plausibel(x, pay):
+    """Passt das Typ-Byte zu Datenstrom, Unterkanal und Paketlaenge?"""
+    t, n = pay[0], len(pay)
+    if x.A == 0x00:
+        return t in (0x00, 0x01, 0x02, 0x0B, 0x80, 0x81, 0x82)
+    if x.A == 0x01 and not x.B & 0x80 and t in (0x05, 0x06):
+        return (t == 0x06) == (n == 8)
+    if x.A == 0x03 and not x.B & 0x80 and t in (0x07, 0x08, 0x0A):
+        return True
+    if n == 8:
+        return t in (0x01, 0x03, 0x04, 0xFF)
+    if n == 256:
+        return t in (0x02, 0x04, 0x0C)
+    if x.B & 0x80:
+        return t in (0x00, 0x01, 0x02, 0x03, 0x04, 0x09, 0x0C)
+    return t in (0x02, 0x03, 0x04, 0x0C)
+
+
+def _inhalt_bestaetigt(x, pay):
+    """Belegt der Inhalt selbst die Reihenfolge der Bytes?"""
+    t, n = pay[0], len(pay)
+    if x.A == 0x01 and not x.B & 0x80:
+        if t == 0x05 and n != 8:
+            from videodat_prng import identify_type05
+            return n in (16, 32, 64, 128, 256) and \
+                identify_type05(pay)["matches_prng"]
+        if t == 0x06 and n == 8:
+            try:
+                datetime.datetime(1900 + pay[1], pay[2], pay[3], pay[4],
+                                  pay[5], pay[6])
+            except ValueError:
+                return False
+            return 88 <= pay[1] <= 99
+    if x.A == 0x03 and not x.B & 0x80 and t in (0x07, 0x08, 0x0A):
+        from videodat_crypto import decrypt_service_payload
+        try:
+            return decrypt_service_payload(3, pay)["checksum_ok"]
+        except ValueError:
+            return False
+    if n == 8 and t == 0xFF:
+        from videodat_prng import matches_type_ff
+        return matches_type_ff(pay)
+    return False
+
+
+def _lesarten(raw):
+    """Alle verschiedenen Nutzlasten, die die 64 Permutationen ergeben."""
+    n = 1 << (raw[3] & 15)
+    return {bytes(_entwuerfeln(raw, qperm(d, e << 2, f << 1), n))
+            for d in range(8) for e in range(2) for f in range(4)}
+
+
+def korrigiere_permutation(pk):
+    """Pakete mit gekippten Permutationsbits richtigstellen.
+
+    1. Kopien: Gleicher Kopf und gleiche Rohdaten, aber andere Permutation.
+       Es gilt die haeufigste Lesart mit plausiblem Typ; Gleichstand bleibt
+       unveraendert.
+    2. Inhalt: Ohne Kopie zaehlt nur eine eindeutige Lesart, die der Inhalt
+       belegt (Zufallsfolge, Uhrzeit, innere Pruefsumme). Dateibloecke haben
+       keinen solchen Beleg und bleiben dann Luecken: Typ 04 allein laesst
+       mehrere Lesarten zu, eine falsche wuerde die Datei unbemerkt verderben.
+    3. Unplausible Pakete, die erst beim Zusammensetzen aus Kopien "gueltig"
+       wurden, sind Fehlreparaturen und werden verworfen.
+    Pakete unter 8 Bytes haben keine Permutation."""
+    stat = collections.Counter()
+    ok = [x for x in pk if x.ok and x.pay and len(x.pay) >= 8]
+    gruppen = collections.defaultdict(list)
+    for x in ok:
+        gruppen[(x.raw[2:5], x.raw[9:])].append(x)
+    for xs in gruppen.values():
+        if len({bytes(x.pay) for x in xs}) < 2:
+            continue
+        stimmen = collections.Counter(bytes(x.pay) for x in xs
+                                      if _typ_plausibel(x, x.pay))
+        best = stimmen.most_common(2)
+        if not best or (len(best) > 1 and best[0][1] == best[1][1]):
+            continue
+        for x in xs:
+            if bytes(x.pay) != best[0][0]:
+                x.pay, x.how = best[0][0], "permutation"
+                stat["kopien"] += 1
+    for x in ok:
+        if _typ_plausibel(x, x.pay):
+            continue
+        belegt = [p for p in _lesarten(x.raw) if _inhalt_bestaetigt(x, p)]
+        if len(belegt) == 1:
+            x.pay, x.how = belegt[0], "permutation"
+            stat["inhalt"] += 1
+        elif x.how == "kopien":
+            x.ok = False
+            stat["verworfen"] += 1
+    return stat
 
 
 # ---------------------------------------------------------------------------
@@ -1300,6 +1413,10 @@ def assemble(pk, outdir, keep_partial, dump_other, log, file_manifest=None):
                     all(32 <= c < 127 for c in p[8:8 + p[7]]):
                 info = p[8:8 + p[7]].decode("ascii")
                 log("  Strom %02X: Infoblock '%s'" % (A, info))
+            if t == 0x09 and len(p) > 16 and 2 < p[15] < 40 and \
+                    all(32 <= c < 127 for c in p[16:16 + p[15]]):
+                info = p[16:16 + p[15]].decode("ascii")
+                log("  Strom %02X: Infoblock Bezahlsendung '%s'" % (A, info))
         finish(cur)
         if keep_partial:
             for run in orphan_runs:
@@ -1465,6 +1582,30 @@ class Uhr:
         return out
 
 
+def _bitlisten(ok, typ):
+    """Bitlisten aus Strom 00 sammeln: {Nummer: {Block: Counter(32 Bytes)}}"""
+    lists = collections.defaultdict(dict)
+    W = 32
+    for x in ok:
+        p = x.pay
+        if x.A == 0x00 and p[0] == typ and len(p) >= 16:
+            blk = p[2] | p[3] << 8
+            n = p[5] | p[6] << 8
+            u = _unrun(p[7:])
+            for k in range(n):
+                seg = bytes(u[k * W:(k + 1) * W])
+                if len(seg) == W:
+                    lists[p[1]].setdefault(blk + k,
+                                           collections.Counter())[seg] += 1
+    return lists
+
+
+def _liste_bytes(d):
+    W = 32
+    return b"".join(d[y].most_common(1)[0][0] if y in d else bytes(W)
+                    for y in range(max(d) + 1))
+
+
 def analyse_dienste(pk, outdir, log):
     ok = [x for x in pk if x.ok and x.pay]
     os.makedirs(outdir, exist_ok=True)
@@ -1503,21 +1644,61 @@ def analyse_dienste(pk, outdir, log):
     else:
         w("  keine Uhrzeit-Pakete gefunden")
 
+    # --- Datum -----------------------------------------------------------
+    w("")
+    w("DATUM")
+    tage_uhr = collections.Counter(t.date() for _, t in gut)
+    tage_kopf = collections.Counter()
+    for x in ok:
+        if x.B & 0x80 and x.pay[0] in (0x00, 0x01, 0x09) and len(x.pay) >= 8:
+            t = _dos_dt(x.pay[1:5])
+            if t:
+                tage_kopf[t.date()] += 1
+    tage_zaehler = collections.Counter()
+    for x in ok:
+        # Strom 00 Typ 0B: Tage seit dem 31.12.1989, nur 1992 beobachtet
+        if x.A == 0x00 and x.pay[0] == 0x0B and len(x.pay) == 8:
+            tage_zaehler[datetime.date(1989, 12, 31) + datetime.timedelta(
+                days=x.pay[1] | x.pay[2] << 8)] += 1
+    for name, tage in (("Uhr (Strom 01 Typ 06)", tage_uhr),
+                       ("Sendungskoepfe", tage_kopf),
+                       ("Tageszaehler (Strom 00 Typ 0B)", tage_zaehler)):
+        if tage:
+            w("  %s: %s" % (name, ", ".join(
+                "%s (%dx)" % (d.strftime("%d.%m.%Y"), c)
+                for d, c in tage.most_common(4))))
+    if tage_uhr and tage_kopf and \
+            tage_uhr.most_common(1)[0][0] != tage_kopf.most_common(1)[0][0]:
+        w("  ACHTUNG: Uhr und Sendungskoepfe nennen verschiedene Tage. Die "
+          "Aufnahme kann aus mehreren Teilen bestehen, die Uhrzeiten im Bericht "
+          "sind dann unzuverlaessig.")
+
     # --- Sendungsablauf ---------------------------------------------------
     w("")
     w("SENDUNGSABLAUF")
     ereig = []
+    verwaltung = collections.Counter()
     for x in ok:
         p = x.pay
-        if x.A == 0x00 and p[0] in (0x01, 0x02, 0x81, 0x82) and len(p) == 8:
-            art = {0x82: "Beginn", 0x81: "Ende", 0x02: "Beginn?",
-                   0x01: "Ende?"}[p[0]]
+        if x.A == 0x00 and p[0] in (0x01, 0x02) and len(p) == 8:
+            verwaltung[(p[0], p[1])] += 1
+        elif x.A == 0x00 and p[0] in (0x81, 0x82) and len(p) == 8:
+            art = {0x82: "Beginn", 0x81: "Ende"}[p[0]]
             ereig.append((x.pos, "Steuerung: %-7s Strom %02X" % (art, p[1])))
         elif x.B & 0x80 and p[0] == 0x00 and len(p) > 9:
             n = p[7]
             name = bytes(p[8:8 + n]).decode("cp437", "replace").strip()
-            ereig.append((x.pos, "Strom %02X Sendungskopf '%s', Sendezeit %s"
-                          % (x.A, name, hm(_dos_dt(p[1:5])))))
+            ereig.append((x.pos, "Strom %02X Sendungskopf '%s', %d Datei(en), "
+                          "Sendezeit %s" % (x.A, name, p[5] | p[6] << 8,
+                                            hm(_dos_dt(p[1:5])))))
+        elif x.B & 0x80 and p[0] == 0x09 and len(p) > 16:
+            from videodat_files import unwrap_transmission
+            kopf = unwrap_transmission(p)
+            if kopf["checksum_ok"]:
+                name = bytes(p[16:16 + p[15]]).decode("cp437", "replace").strip()
+                ereig.append((x.pos, "Strom %02X Bezahlsendung '%s', Preisfeld "
+                              "%d, Sendezeit %s" % (x.A, name, kopf["price_raw"],
+                                                    hm(_dos_dt(p[1:5])))))
         elif x.B & 0x80 and p[0] == 0x01 and len(p) == 8:
             ereig.append((x.pos, "Strom %02X Sendungsende, Zeit %s" %
                           (x.A, hm(_dos_dt(p[1:5])))))
@@ -1539,28 +1720,22 @@ def analyse_dienste(pk, outdir, log):
         w("    Strom %02X/%d: %s - %s, %d Pakete" %
           (A, sub, hm(uhr(min(ps))), hm(uhr(max(ps))), len(ps)))
 
+    if verwaltung:
+        w("")
+        w("  Strom 00, Typ 01/02 (Bedeutung offen; 1992 alle paar Sekunden):")
+        for (t, wert), c in sorted(verwaltung.items()):
+            w("    Typ %02X Wert %02X: %dx" % (t, wert, c))
+
     # --- Bitlisten ----------------------------------------------------
     W = 32
-    lists = collections.defaultdict(dict)
-    for x in ok:
-        p = x.pay
-        if x.A == 0x00 and p[0] == 0x00 and len(p) >= 16:
-            blk = p[2] | p[3] << 8
-            n = p[5] | p[6] << 8
-            u = _unrun(p[7:])
-            for k in range(n):
-                seg = bytes(u[k * W:(k + 1) * W])
-                if len(seg) == W:
-                    lists[p[1]].setdefault(blk + k,
-                                           collections.Counter())[seg] += 1
+    lists = _bitlisten(ok, 0x00)
     w("")
     w("BITLISTEN (Strom 00, Typ 00) - vermutlich Freischaltung je Dienst,")
     w("ein Bit je Decoder-/Teilnehmernummer (Bit 7 des ersten Bytes = Nr. 0)")
     bits = {}
     for lid, d in sorted(lists.items()):
         H = max(d) + 1
-        data = b"".join(d[y].most_common(1)[0][0] if y in d else bytes(W)
-                        for y in range(H))
+        data = _liste_bytes(d)
         fehl = H - len(d)
         b = np.unpackbits(np.frombuffer(data, np.uint8))
         bits[lid] = b
@@ -1600,6 +1775,31 @@ def analyse_dienste(pk, outdir, log):
                 w("    Liste %02X ist (fast) Teilmenge von Liste %02X "
                   "(%d von %d Bit ausserhalb)" %
                   (a, c, int((ba & ~bc).sum()), int(ba.sum())))
+
+    # --- Bitlisten je Sendung (Typ 80) --------------------------------
+    sendungslisten = _bitlisten(ok, 0x80)
+    if sendungslisten:
+        w("")
+        w("BITLISTEN JE SENDUNG (Strom 00, Typ 80) - Format wie Typ 00, Byte 1 "
+          "= Datenstrom;")
+        w("vermutlich die Freischaltung fuer diese Sendung, kurz vor Sendungsbeginn")
+        for lid, d in sorted(sendungslisten.items()):
+            data = _liste_bytes(d)
+            b = np.unpackbits(np.frombuffer(data, np.uint8))
+            name = "bitliste_strom_%02X.bin" % lid
+            open(os.path.join(outdir, name), "wb").write(data)
+            nz = np.nonzero(b)[0]
+            bezug = []
+            for k in sorted(bits):
+                n = min(len(b), len(bits[k]))
+                if b.sum() and not (b[:n] & ~bits[k][:n]).sum():
+                    bezug.append("%s Liste %02X" % (
+                        "gleich" if b.sum() == bits[k].sum() else "Teilmenge von",
+                        k))
+            w("  Strom %02X: %d Bit (%d Bloecke, %d fehlen), %d gesetzt%s%s -> %s"
+              % (lid, len(b), max(d) + 1, max(d) + 1 - len(d), len(nz),
+                 " (Nr. %d)" % nz[0] if len(nz) == 1 else "",
+                 ", " + ", ".join(bezug) if bezug else "", name))
 
     # --- verschluesselte / unbekannte Dienste ------------------------------
     w("")
@@ -1644,6 +1844,12 @@ def analyse_dienste(pk, outdir, log):
           " -> %s" % (A, t, len(xs), len(verschieden), hm(uhr(xs[0].pos)),
                       hm(uhr(xs[-1].pos)), texte[(A, t)], name))
     w("  (Format der .bin: je Paket 2 Byte Laenge LE + Nutzlast)")
+    fuell = {bytes(x.pay) for x in ok if x.pay[0] == 0xFF and len(x.pay) == 8}
+    if fuell:
+        from videodat_prng import matches_type_ff
+        w("  Typ FF (je Sendung, Zaehler 07/08): %d verschieden, %d passen zum "
+          "Zufallsgenerator von Strom 01 Typ 05 (Fuelldaten)" %
+          (len(fuell), sum(matches_type_ff(p) for p in fuell)))
     with open(os.path.join(outdir, "dienste.txt"), "w",
               encoding="utf-8") as f:
         f.write("\n".join(rep) + "\n")
@@ -1771,6 +1977,11 @@ def main():
     log("Pakete: %d gefunden, %d Pruefsumme ok, repariert: %d per "
         "Soft-Decision, %d aus Kopien" %
         (len(pk), n_ok, fixed["soft"], fixed["kopien"]))
+    perm = korrigiere_permutation(pk)
+    if perm:
+        log("  Permutationsfehler: %d aus Kopien, %d am Inhalt korrigiert, "
+            "%d Fehlreparaturen verworfen" %
+            (perm["kopien"], perm["inhalt"], perm["verworfen"]))
     if n_unstuffed:
         log("  %d Pakete nach Entfernen von Sync-Escape-Bytes gueltig" % n_unstuffed)
     file_manifest = [] if args.decrypt_files else None
