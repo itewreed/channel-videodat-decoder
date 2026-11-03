@@ -185,15 +185,15 @@ length is only known from the packet header.
 | Stream/type | Content |
 |---|---|
 | 00/00 | Bit lists, one bit per subscriber number |
-| 00/02, 00/01 | Unknown. 1992 every few seconds with values 00 and 01, 1993 rarely, also with 64 and 65 |
+| 00/02, 00/01 | Probably a placeholder for a bit list without data, byte 1 is the list. In 1993 the lists run in a fixed cycle (00, 01, 02, 03, 10, 11, 64, 65), these packets take the place of the missing list and share its counter, and no list appears in both forms on a recording. 00/01 was only seen for list 02. This is inferred from the data: `WINVD.EXE`, `VD33.EXE` and `MD-SE.exe` show no handling of these packets, so the decoder ROM probably evaluates them |
 | 00/0B | Day counter: days since 31 December 1989, then 4 more bytes of unknown meaning. Only seen in two recordings from 1992 |
 | 00/80 | Bit list for one transmission, same format as 00/00, byte 1 is the data stream. Sent shortly before the transmission starts and matches a general list (10, 64, 65) or contains a single number. Probably the entitlement for this transmission |
 | 00/81, 00/82 | End and start of a data stream (byte 1) |
 | 01/05 | Filler from a pseudo-random generator |
 | 01/06 | Clock |
 | 03/07, 03/08, 03/0A | Encrypted services, see [`decrypt_services.py`](#decrypt_servicespy) |
-| \*/00, \*/01 | Transmission header and end, subchannel 1. The header holds the send time, the number of files and the name, the rest of the packet is often an uninitialised buffer of the sending computer (e.g. `c:\SENDUNG\DOS-SHAR\...`) |
-| \*/09 | Header of a paid transmission with an encrypted price in Pfennig (300 = DM 3,00). All 8 paid transmissions of a December 1993 recording match the prices in the `SHARESHP.VDB` catalogue |
+| \*/00, \*/01 | Transmission header and end, subchannel 1. Header: `00`, send time (4 bytes), number of files (2), then directory, command and comment, each with a length byte in front. The rest of the packet is often an uninitialised buffer of the sending computer (e.g. `c:\SENDUNG\DOS-SHAR\...`). The field names come from `MD-SE.exe`; the command is almost always empty, the meaning of `Z` on some headers from late 1993 is unknown |
+| \*/09 | Header of a paid transmission, like \*/00 with 8 more bytes before the directory, with an encrypted price in Pfennig (300 = DM 3,00). All 8 paid transmissions of a December 1993 recording match the prices in the `SHARESHP.VDB` catalogue |
 | \*/FF | 8 bytes from the same generator as 01/05, sent at a fixed place in each transmission |
 
 The packet checksum is a plain sum, so a bit error in the permutation bytes
@@ -203,6 +203,10 @@ content proves the order (generator sequence, clock, inner checksum). A file
 block without a copy stays a gap, because several orders would give type 04 and
 a wrong one would corrupt the file silently. Payloads above 256 bytes are
 treated as damaged headers.
+
+Not supported: the WDR Computerclub transmissions from 2000, as read by
+`MD-SE.exe`, use a simpler packet without scrambling: `56 AE`, stream, length,
+counter, type, payload, 16-bit sum.
 
 ### 1990 variant
 
