@@ -101,6 +101,27 @@ def identify_type05(payload):
     return result
 
 
+def matches_type_ff(payload):
+    """Check an 8-byte type FF packet against the same generator.
+
+    Byte zero is the packet type and byte one cannot be checked without the
+    state, so the three complete words carry the evidence (about 2**-14 chance
+    of a random match).
+    """
+    payload = bytes(payload)
+    if len(payload) != 8 or payload[0] != 0xFF:
+        return False
+    first, second, third = struct.unpack("<3H", payload[2:])
+    if (first | second | third) & 0x8000:
+        return False
+    for low in _candidate_low_bits(first, second):
+        state = (MULTIPLIER * ((first << 16) | low) + 1) & MASK
+        if state >> 16 == second and \
+                ((MULTIPLIER * state + 1) & MASK) >> 16 == third:
+            return True
+    return False
+
+
 def analyse_type05(payload):
     """Classify exact matches and conservative corruption candidates.
 

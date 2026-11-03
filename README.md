@@ -57,6 +57,9 @@ Reads the raw capture, slices the VideoDat lines into bits (NRZ, 2 Mbit/s,
 (sync `56 AE`), descrambles and verifies them, repairs damaged packets from
 multiple copies and assembles the transmitted files. It also evaluates the
 other services (clock, broadcast schedule, bit lists, encrypted data).
+The checksum does not protect the permutation bytes of the packet header, so
+the decoder also corrects packets with flipped permutation bits, see
+[Packet types](#packet-types).
 Recordings of the 1990 variant (800 kbit/s, 4 bytes per line) are detected
 automatically and decoded with their own packet format, see
 [1990 variant](#1990-variant).
@@ -125,6 +128,7 @@ out/
   dienste/
     dienste.txt                report on clock, schedule and other services
     bitliste_XX.bin / .png     bit lists (e.g. entitlements)
+    bitliste_strom_XX.bin      bit list sent for one transmission on stream XX (type 80)
     dienst_XX_typYY.bin        raw data of further services (per packet: 2-byte LE length + payload)
     dienst_01_typ05_analysis.jsonl
     decrypted_services.jsonl   only with --decrypt-services
@@ -171,6 +175,34 @@ python3 videodat_decoder.py tape455.tbcy --format tbc -o out1990
 # re-analyse one saved 1990 channel
 python3 videodat_decoder.py tape455_zeilen_11-324+12-325.bytes --bytes --variant 1990 -o out3
 ```
+
+### Packet types
+
+Packets of the 1993 variant that are not file data. `*` means any data stream.
+`--dump-other` writes them to `andere_dienste/` without any framing; the packet
+length is only known from the packet header.
+
+| Stream/type | Content |
+|---|---|
+| 00/00 | Bit lists, one bit per subscriber number |
+| 00/02, 00/01 | Unknown. 1992 every few seconds with values 00 and 01, 1993 rarely, also with 64 and 65 |
+| 00/0B | Day counter: days since 31 December 1989, then 4 more bytes of unknown meaning. Only seen in two recordings from 1992 |
+| 00/80 | Bit list for one transmission, same format as 00/00, byte 1 is the data stream. Sent shortly before the transmission starts and matches a general list (10, 64, 65) or contains a single number. Probably the entitlement for this transmission |
+| 00/81, 00/82 | End and start of a data stream (byte 1) |
+| 01/05 | Filler from a pseudo-random generator |
+| 01/06 | Clock |
+| 03/07, 03/08, 03/0A | Encrypted services, see [`decrypt_services.py`](#decrypt_servicespy) |
+| \*/00, \*/01 | Transmission header and end, subchannel 1. The header holds the send time, the number of files and the name, the rest of the packet is often an uninitialised buffer of the sending computer (e.g. `c:\SENDUNG\DOS-SHAR\...`) |
+| \*/09 | Header of a paid transmission with an encrypted price in Pfennig (300 = DM 3,00). All 8 paid transmissions of a December 1993 recording match the prices in the `SHARESHP.VDB` catalogue |
+| \*/FF | 8 bytes from the same generator as 01/05, sent at a fixed place in each transmission |
+
+The packet checksum is a plain sum, so a bit error in the permutation bytes
+yields a valid-looking packet with its bytes in the wrong order, often with a
+wrong type. The decoder corrects such a packet from its copies, or when the
+content proves the order (generator sequence, clock, inner checksum). A file
+block without a copy stays a gap, because several orders would give type 04 and
+a wrong one would corrupt the file silently. Payloads above 256 bytes are
+treated as damaged headers.
 
 ### 1990 variant
 
