@@ -1520,12 +1520,22 @@ def assemble(pk, outdir, keep_partial, dump_other, log, file_manifest=None):
 #                    genau 65536 Bit; die Listen 03/10/11 sind (fast)
 #                    Teilmengen von Liste 00 -> vermutlich Freischaltung je
 #                    Dienst, ein Bit pro Decoder-/Teilnehmernummer.
-#   Strom 00 Typ 01/02/81/82  Steuermeldung [Typ][Strom]: 82/81 = Beginn/
-#                    Ende einer Sendung im Unterkanal 1 (z.B. 82 94, 81 F5),
-#                    02/01 entsprechend im Unterkanal 0 (Bedeutung unsicher)
+#   Strom 00 Typ 81/82  Steuermeldung [Typ][Strom]: Ende/Beginn einer Sendung
+#                    im Unterkanal 1 (z.B. 82 94, 81 F5)
+#   Strom 00 Typ 01/02  [Typ][Liste]: vermutlich Platzhalter fuer eine Bitliste
+#                    ohne Daten. 1993 laufen die Listen im Kreis (00 01 02 03
+#                    10 11 64 65), die Pakete stehen auf dem Platz der fehlenden
+#                    Liste und teilen deren Zaehler; eine Liste kommt auf keinem
+#                    Band in beiden Formen vor. Typ 01 nur fuer Liste 02. Aus den
+#                    Daten erschlossen, im Empfangsprogramm nicht belegt (die
+#                    Auswertung sitzt wohl im ROM des Decoders).
 #   In Sendungsstroemen (Unterkanal 1):
-#     Typ 00  Sendungskopf: 00 [DOS-Zeit 4] [2 Byte] [Laenge] [Kennung]
+#     Typ 00  Sendungskopf: 00 [DOS-Zeit 4] [Dateien 2] [n] [Verzeichnis]
+#             [n] [Kommando] [n] [Kommentar], danach oft Pufferreste
+#             (Feldnamen aus MD-SE.exe, siehe _kopf_felder)
 #     Typ 01  Sendungsende: 01 [DOS-Zeit 4] ...
+#     Typ 09  Kopf einer Bezahlsendung: wie Typ 00, vor [n] [Verzeichnis]
+#             zusaetzlich 8 verschluesselte Bytes mit dem Preis
 # ---------------------------------------------------------------------------
 def _unrun(b):
     out = bytearray()
@@ -1580,6 +1590,25 @@ class Uhr:
             if dt - erwartet > 30 or dt < 0:
                 out.append((p0, t0, t1, dt - erwartet))
         return out
+
+
+def _kopf_felder(p, i):
+    """Verzeichnis, Kommando und Kommentar eines Sendungskopfs ab Offset i.
+
+    Jedes Feld hat ein Laengenbyte davor; was nicht ins Paket passt, bleibt
+    leer."""
+    felder = []
+    for _ in range(3):
+        n = p[i] if i < len(p) else 0
+        felder.append(bytes(p[i + 1:i + 1 + n]).decode("cp437", "replace").strip()
+                      if i + 1 + n <= len(p) else "")
+        i += 1 + n
+    return felder
+
+
+def _kopf_text(kommando, kommentar):
+    return "".join([", Kommando '%s'" % kommando if kommando else "",
+                    ", Kommentar '%s'" % kommentar if kommentar else ""])
 
 
 def _bitlisten(ok, typ):
@@ -1681,26 +1710,27 @@ def analyse_dienste(pk, outdir, log):
     for x in ok:
         p = x.pay
         if x.A == 0x00 and p[0] in (0x01, 0x02) and len(p) == 8:
-            verwaltung[(p[0], p[1])] += 1
+            verwaltung[(p[0], p[1])] += 1      # Ausgabe bei den Bitlisten
         elif x.A == 0x00 and p[0] in (0x81, 0x82) and len(p) == 8:
             art = {0x82: "Beginn", 0x81: "Ende"}[p[0]]
             ereig.append((x.pos, "Steuerung: %-7s Strom %02X" % (art, p[1])))
         elif x.B & 0x80 and p[0] == 0x00 and len(p) > 9:
-            n = p[7]
-            name = bytes(p[8:8 + n]).decode("cp437", "replace").strip()
-            ereig.append((x.pos, "Strom %02X Sendungskopf '%s', %d Datei(en), "
+            name, kommando, kommentar = _kopf_felder(p, 7)
+            ereig.append((x.pos, "Strom %02X Sendungskopf '%s', %d Datei(en)%s, "
                           "Sendezeit %s" % (x.A, name, p[5] | p[6] << 8,
+                                            _kopf_text(kommando, kommentar),
                                             hm(_dos_dt(p[1:5])))))
         elif x.B & 0x80 and p[0] == 0x09 and len(p) > 16:
             from videodat_files import unwrap_transmission
             kopf = unwrap_transmission(p)
             if kopf["checksum_ok"]:
-                name = bytes(p[16:16 + p[15]]).decode("cp437", "replace").strip()
+                name, kommando, kommentar = _kopf_felder(p, 15)
                 # Preis in Pfennig, wie im Katalog (SHARESHP.VDB)
-                ereig.append((x.pos, "Strom %02X Bezahlsendung '%s', DM %d,%02d, "
+                ereig.append((x.pos, "Strom %02X Bezahlsendung '%s', DM %d,%02d%s, "
                               "Sendezeit %s" % ((x.A, name) +
                                                 divmod(kopf["price_raw"], 100) +
-                                                (hm(_dos_dt(p[1:5])),))))
+                                                (_kopf_text(kommando, kommentar),
+                                                 hm(_dos_dt(p[1:5]))))))
         elif x.B & 0x80 and p[0] == 0x01 and len(p) == 8:
             ereig.append((x.pos, "Strom %02X Sendungsende, Zeit %s" %
                           (x.A, hm(_dos_dt(p[1:5])))))
@@ -1721,12 +1751,6 @@ def analyse_dienste(pk, outdir, log):
             continue
         w("    Strom %02X/%d: %s - %s, %d Pakete" %
           (A, sub, hm(uhr(min(ps))), hm(uhr(max(ps))), len(ps)))
-
-    if verwaltung:
-        w("")
-        w("  Strom 00, Typ 01/02 (Bedeutung offen; 1992 alle paar Sekunden):")
-        for (t, wert), c in sorted(verwaltung.items()):
-            w("    Typ %02X Wert %02X: %dx" % (t, wert, c))
 
     # --- Bitlisten ----------------------------------------------------
     W = 32
@@ -1777,6 +1801,13 @@ def analyse_dienste(pk, outdir, log):
                 w("    Liste %02X ist (fast) Teilmenge von Liste %02X "
                   "(%d von %d Bit ausserhalb)" %
                   (a, c, int((ba & ~bc).sum()), int(ba.sum())))
+
+    if verwaltung:
+        w("  Listen ohne Daten (Strom 00, Typ 01/02) - vermutlich Platzhalter:")
+        for (t, wert), c in sorted(verwaltung.items()):
+            w("    Liste %02X: Typ %02X, %dx%s" % (
+                wert, t, c, ", aber auch als Daten empfangen" if wert in bits
+                else ""))
 
     # --- Bitlisten je Sendung (Typ 80) --------------------------------
     sendungslisten = _bitlisten(ok, 0x80)
